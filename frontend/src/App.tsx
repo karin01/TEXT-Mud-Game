@@ -47,7 +47,7 @@ import { ELEMENT_TO_STATUS, STATUS_DOT_DAMAGE, getStatusDotMultiplierForZone, ST
 import { PASSIVE_LIST, getPassiveById, getPassiveByName, getElementResistances, isResistPassive, isRegenPassive, MAX_RESIST_LEVEL, REGEN_MAX_LEVEL, REGEN_PER_LEVEL, getRegenUpgradePrice } from './data/passives';
 import { MASTERY_EXP_PER_HIT, MASTERY_EXP_TABLE, expToLevel, WEAPON_CLASS_LABEL } from './data/weaponMastery';
 import { saveCharacter } from './utils/saveSystem';
-import { chanceToD20Dc, formatD20Check, resolveD20Check, resolveD20Hit, type RollMode } from './utils/d20';
+import { chanceToD20Dc, formatD20Check, formatD20Resolution, resolveD20Check, resolveD20Hit, type RollMode } from './utils/d20';
 import {
   applyEquippedRuneSkillsToList,
   applyPaladinRuneResist,
@@ -2348,55 +2348,6 @@ const App: React.FC = () => {
     });
   }, []);
 
-  // ─────────────────────────────────────────
-  // d20 주사위 팝업 (명중 판정 가시화)
-  // WHY: 전투의 명중/빗나감이 주사위 결과로 “설명 가능”해야 한다.
-  // ─────────────────────────────────────────
-  const [diceModal, setDiceModal] = useState<null | {
-    title: string;
-    subtitle?: string;
-    mode: RollMode;
-    rolls: number[];
-    chosen: number;
-    modifierLabel: string;
-    modifierValue: number;
-    proficiencyLabel: string;
-    proficiencyValue: number;
-    total: number;
-    dc: number;
-    outcome: '성공' | '실패' | '치명타' | '펌블';
-  }>(null);
-  const showDiceModal = useCallback((next: {
-    title: string;
-    subtitle?: string;
-    mode: RollMode;
-    rolls: number[];
-    chosen: number;
-    modifierLabel?: string;
-    modifierValue?: number;
-    proficiencyLabel?: string;
-    proficiencyValue?: number;
-    total: number;
-    dc: number;
-    outcome: '성공' | '실패' | '치명타' | '펌블';
-  }) => {
-    setDiceModal({
-      title: next.title,
-      subtitle: next.subtitle,
-      mode: next.mode,
-      rolls: next.rolls,
-      chosen: next.chosen,
-      modifierLabel: next.modifierLabel ?? '수정치',
-      modifierValue: next.modifierValue ?? 0,
-      proficiencyLabel: next.proficiencyLabel ?? '숙련',
-      proficiencyValue: next.proficiencyValue ?? 0,
-      total: next.total,
-      dc: next.dc,
-      outcome: next.outcome,
-    });
-  }, []);
-  const closeDiceModal = useCallback(() => setDiceModal(null), []);
-
   useEffect(() => {
     if (!playerDamagePop) return;
     const t = window.setTimeout(() => setPlayerDamagePop(null), 1150);
@@ -2476,23 +2427,12 @@ const App: React.FC = () => {
         const chance = computeHitChanceFromAtkDef(args.attackerAtk, args.defenderDef);
         const dc = chanceToD20Dc(chance);
         const r = resolveD20Check({ dc, mode: args.mode ?? 'normal' });
-        const outcome: '성공' | '실패' | '치명타' | '펌블' = r.crit ? '치명타' : r.fumble ? '펌블' : r.hit ? '성공' : '실패';
-        showDiceModal({
-          title: `${args.title} 명중 판정`,
-          subtitle:
-            `공격력 ${Math.round(args.attackerAtk)} vs 방어력 ${Math.round(args.defenderDef)}\n` +
-            `성공률 ${(chance * 100).toFixed(0)}%  (p = (ATK-DEF)/ATK)`,
-          mode: r.roll.mode,
-          rolls: [...r.roll.rolls],
-          chosen: r.roll.chosen,
-          modifierLabel: '수정치',
-          modifierValue: 0,
-          proficiencyLabel: '확률',
-          proficiencyValue: 0,
-          total: r.roll.chosen,
-          dc,
-          outcome,
-        });
+        setLogs((prev) => [
+          ...prev,
+          `🎯 ${args.title} 명중 판정`,
+          `공격력 ${Math.round(args.attackerAtk)} vs 방어력 ${Math.round(args.defenderDef)} · 성공률 ${(chance * 100).toFixed(0)}% (p = (ATK-DEF)/ATK)`,
+          formatD20Check(r),
+        ]);
         return { ...r, chance };
       };
 
@@ -3537,22 +3477,13 @@ const App: React.FC = () => {
                     : 'normal';
               const dc = chanceToD20Dc(hitChance);
               const r = resolveD20Check({ dc, mode });
-              const outcome: '성공' | '실패' | '치명타' | '펌블' = r.crit ? '치명타' : r.fumble ? '펌블' : r.hit ? '성공' : '실패';
-              showDiceModal({
-                title: `${enemy.name} 명중 판정`,
-                subtitle: `공격력 ${Math.round(enemy.atk)} vs 방어력 ${Math.round(totalPlayerDef)}\n성공률 ${(hitChance * 100).toFixed(0)}% (환경 보정 포함)`,
-                mode: r.roll.mode,
-                rolls: [...r.roll.rolls],
-                chosen: r.roll.chosen,
-                proficiencyLabel: '확률',
-                proficiencyValue: 0,
-                modifierLabel: '수정치',
-                modifierValue: 0,
-                total: r.roll.chosen,
-                dc,
-                outcome,
-              });
-              setLogs((prev) => appendEnemyCombatLog(prev, formatD20Check(r)));
+              setLogs((prev) =>
+                appendEnemyCombatLog(prev, [
+                  `🎯 적의 공격 명중 판정`,
+                  `공격력 ${Math.round(enemy.atk)} vs 방어력 ${Math.round(totalPlayerDef)} · 성공률 ${(hitChance * 100).toFixed(0)}% (환경 보정 포함)`,
+                  formatD20Check(r),
+                ].join('\n')),
+              );
               if (!r.hit) {
                 pushEnemyCombatLine('💨 공격이 빗나갔습니다. (d20 판정)');
                 setActiveEnemies(prev => prev.map(e => e.id === enemy.id ? { ...e, atkBuffTurns: Math.max(0, (e.atkBuffTurns ?? 0) - 1), atkBuffBonus: (e.atkBuffTurns ?? 0) <= 1 ? 0 : (e.atkBuffBonus ?? 0) } : e));
@@ -5681,21 +5612,12 @@ const App: React.FC = () => {
                   targetAC: def.breakDc,
                   mode: 'normal',
                 });
-                const outcome: '성공' | '실패' | '치명타' | '펌블' =
-                  r.crit ? '치명타' : r.fumble ? '펌블' : r.hit ? '성공' : '실패';
-                showDiceModal({
-                  title: 'STR 능력치 판정',
-                  mode: r.roll.mode,
-                  rolls: [...r.roll.rolls],
-                  chosen: r.roll.chosen,
-                  modifierLabel: '수정치',
-                  modifierValue: strMod,
-                  proficiencyLabel: '숙련',
-                  proficiencyValue: proficiency,
-                  total: r.total,
-                  dc: def.breakDc,
-                  outcome,
-                });
+                setLogs((prev) => [
+                  ...prev,
+                  '🧱 [잠금 보관함] STR 강제 개방 판정',
+                  `STR 수정치 ${strMod >= 0 ? '+' : ''}${strMod} · DC ${def.breakDc}`,
+                  formatD20Resolution(r),
+                ]);
                 setSearchedRooms(prev => new Set(prev).add(currentRoomId));
                 if (!r.hit) {
                   // 실패: 반동/무리로 약간의 내구도 손상 가능
@@ -5725,21 +5647,12 @@ const App: React.FC = () => {
                 targetAC: def.dc,
                 mode: 'normal',
               });
-              const outcome: '성공' | '실패' | '치명타' | '펌블' =
-                r.crit ? '치명타' : r.fumble ? '펌블' : r.hit ? '성공' : '실패';
-              showDiceModal({
-                title: 'INT 능력치 판정',
-                mode: r.roll.mode,
-                rolls: [...r.roll.rolls],
-                chosen: r.roll.chosen,
-                modifierLabel: '수정치',
-                modifierValue: abilityMod,
-                proficiencyLabel: '숙련',
-                proficiencyValue: proficiency,
-                total: r.total,
-                dc: def.dc,
-                outcome,
-              });
+              setLogs((prev) => [
+                ...prev,
+                '🔒 [잠금 보관함] INT 해제 판정',
+                `INT 수정치 ${abilityMod >= 0 ? '+' : ''}${abilityMod} · DC ${def.dc}`,
+                formatD20Resolution(r),
+              ]);
               setSearchedRooms(prev => new Set(prev).add(currentRoomId));
               if (!r.hit) {
                 response =
@@ -10758,95 +10671,6 @@ const App: React.FC = () => {
         playerState.isCombat ? 'ring-1 ring-inset ring-red-500/25' : ''
       }`}
     >
-      {diceModal && (
-        <div className="absolute inset-0 z-[90] flex items-center justify-center">
-          <div
-            className="absolute inset-0 bg-black/60 backdrop-blur-[2px]"
-            onClick={closeDiceModal}
-            role="button"
-            aria-label="주사위 결과 닫기"
-          />
-          <div className="relative w-[min(520px,92vw)] rounded-2xl border border-white/10 bg-zinc-950/85 shadow-2xl">
-            <div className="px-5 pt-5 pb-4 text-center">
-              <div className="text-[13px] sm:text-[14px] font-semibold tracking-[0.28em] text-zinc-200 uppercase">
-                {diceModal.title}
-              </div>
-              {diceModal.subtitle && (
-                <div className="mt-2 text-[12px] sm:text-[13px] text-zinc-400 whitespace-pre-wrap">
-                  {diceModal.subtitle}
-                </div>
-              )}
-              <div className="mt-5 text-[88px] sm:text-[96px] leading-none font-black text-zinc-100 tabular-nums drop-shadow">
-                {diceModal.chosen}
-              </div>
-
-              {/* 판정식 / 명중 판정 요약 */}
-              {diceModal.proficiencyLabel === '확률' ? (
-                <div className="mt-4 flex flex-wrap items-center justify-center gap-x-3 gap-y-1.5 text-[12px] sm:text-[13px]">
-                  {(() => {
-                    // 명중 판정은 “박스” 대신 한 줄 요약으로 최대한 컴팩트하게 표시
-                    const atk = (diceModal.subtitle || '').match(/공격력\s+(\d+)/)?.[1] ?? '—';
-                    const def = (diceModal.subtitle || '').match(/방어력\s+(\d+)/)?.[1] ?? '—';
-                    const pct = (diceModal.subtitle || '').match(/성공률\s+(\d+)%/)?.[1] ?? '—';
-                    return (
-                      <>
-                        <span className="text-zinc-500">공격력</span>
-                        <span className="font-semibold text-zinc-100 tabular-nums">{atk}</span>
-                        <span className="text-zinc-700">·</span>
-                        <span className="text-zinc-500">방어력</span>
-                        <span className="font-semibold text-zinc-100 tabular-nums">{def}</span>
-                        <span className="text-zinc-700">·</span>
-                        <span className="text-zinc-500">성공률</span>
-                        <span className="font-semibold text-zinc-100 tabular-nums">{pct}%</span>
-                      </>
-                    );
-                  })()}
-                </div>
-              ) : (
-                <div className="mt-4 text-[13px] sm:text-[14px] text-zinc-200">
-                  <span className="text-zinc-400">=</span>{' '}
-                  <span className="font-semibold text-zinc-100 tabular-nums">{diceModal.chosen}</span>{' '}
-                  <span className="text-zinc-500">+</span>{' '}
-                  <span className="text-zinc-300">
-                    {diceModal.modifierLabel}({diceModal.modifierValue >= 0 ? '+' : ''}{diceModal.modifierValue})
-                  </span>{' '}
-                  <span className="text-zinc-500">+</span>{' '}
-                  <span className="text-zinc-300">
-                    {diceModal.proficiencyLabel}({diceModal.proficiencyValue >= 0 ? '+' : ''}{diceModal.proficiencyValue})
-                  </span>{' '}
-                  <span className="text-zinc-500">=</span>{' '}
-                  <span className="font-black text-zinc-100 tabular-nums">{diceModal.total}</span>
-                </div>
-              )}
-
-              {/* DC/부가정보 */}
-              <div className="mt-2 text-[12px] sm:text-[13px] text-zinc-400">
-                목표 DC <span className="font-semibold text-zinc-200 tabular-nums">{diceModal.dc}</span>
-              </div>
-              {diceModal.mode !== 'normal' && (
-                <div className="mt-1 text-[12px] sm:text-[13px] text-zinc-500">
-                  {diceModal.mode === 'adv' ? '어드밴티지' : '디스어드밴티지'}: [{diceModal.rolls.join(', ')}] →{' '}
-                  <span className="font-semibold text-zinc-200">{diceModal.chosen}</span>
-                </div>
-              )}
-
-              <div className="mt-5 flex justify-center">
-                <button
-                  type="button"
-                  onClick={closeDiceModal}
-                  className={`px-6 py-2 rounded-full text-[12px] font-semibold border transition-colors ${
-                    diceModal.outcome === '성공' || diceModal.outcome === '치명타'
-                      ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/15'
-                      : 'border-rose-400/40 bg-rose-500/10 text-rose-200 hover:bg-rose-500/15'
-                  }`}
-                >
-                  {diceModal.outcome}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
       {/* 헤더: 과한 트래킹·글로우 제거, 한 줄로 읽기 쉽게 */}
       <header
         className={`h-12 px-4 sm:px-5 border-b flex justify-between items-center z-50 shrink-0 bg-zinc-900/80 backdrop-blur-md ${
