@@ -1,0 +1,11 @@
+# 로컬 의존성·가상환경 (저장소에 올리지 않음)
+node_modules/
+backend/venv/
+**/__pycache__/
+*.pyc
+frontend/dist/
+
+# 환경·비밀
+.env
+.env.*
+!.env.example
