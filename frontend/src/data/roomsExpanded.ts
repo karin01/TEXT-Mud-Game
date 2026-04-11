@@ -18,7 +18,7 @@ export const ROOMS_EXPANDED: Room[] = [
   { id: 'slum_s2w2s', name: '침수 구역', description: '발목까지 차오른 오염수.', exits: { '북': 'slum_s2w2' }, encounterChance: 0.6, mapX: 1, mapY: 10 },
   { id: 'slum_s3e', name: '창고 동편', description: '녹슨 컨테이너가 널브러진 구역.', exits: { '서': 'slum_s3', '동': 'slum_s3e2' }, encounterChance: 0.5, mapX: 4, mapY: 10 },
   { id: 'slum_s3e2', name: '컨테이너 야적장', description: '버려진 화물 컨테이너 산.', exits: { '서': 'slum_s3e', '남': 'slum_s3e2s' }, encounterChance: 0.55, mapX: 5, mapY: 10 },
-  { id: 'slum_s3e2s', name: '야적장 끝', description: '더 이상 갈 곳이 없는 막다른 곳처럼 보이지만, 남쪽으로 내려가는 좁은 통로가 이어져 있다.', exits: { '북': 'slum_s3e2' }, encounterChance: 0.65, mapX: 5, mapY: 11 },
+  { id: 'slum_s3e2s', name: '야적장 끝', description: '컨테이너로 막힌 막다른 곳이다. 남쪽 벽널은 겉보기엔 그냥 철판이지만, 두드리면 속이 비어 있는 듯한 울림이 날 것 같다. 숨은 통로는 [조사]로 찾을 수 있다.', exits: { '북': 'slum_s3e2' }, encounterChance: 0.65, mapX: 5, mapY: 11 },
   { id: 'slum_s3w', name: '창고 서편', description: '파손된 창고 문들이 흔들린다.', exits: { '동': 'slum_s3', '서': 'slum_s3w2' }, encounterChance: 0.5, mapX: 2, mapY: 10 },
   { id: 'slum_s3w2', name: '폐창고 단지', description: '완전히 버려진 창고 단지.', exits: { '동': 'slum_s3w', '북': 'slum_s3w2n' }, encounterChance: 0.6, mapX: 1, mapY: 10 },
 

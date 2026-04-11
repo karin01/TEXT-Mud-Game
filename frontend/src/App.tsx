@@ -19,6 +19,7 @@ import {
   SCENE_IMAGE_FALLBACK_DATA_URI,
 } from './assets/scene/sceneImageUrls';
 import { initialNpcState, NPC_LIST } from './data/npcs';
+import { DIALOGUE_TREES, type DialogueNpcId, type DialogueTree, type DialogueNode, type DialogueChoice, type DialogueCondition, type DialogueEffect } from './data/dialogues';
 import {
   spawnRandomEnemy,
   spawnEnemy,
@@ -47,7 +48,6 @@ import { ELEMENT_TO_STATUS, STATUS_DOT_DAMAGE, getStatusDotMultiplierForZone, ST
 import { PASSIVE_LIST, getPassiveById, getPassiveByName, getElementResistances, isResistPassive, isRegenPassive, MAX_RESIST_LEVEL, REGEN_MAX_LEVEL, REGEN_PER_LEVEL, getRegenUpgradePrice } from './data/passives';
 import { MASTERY_EXP_PER_HIT, MASTERY_EXP_TABLE, expToLevel, WEAPON_CLASS_LABEL } from './data/weaponMastery';
 import { saveCharacter } from './utils/saveSystem';
-import { chanceToD20Dc, formatD20Check, formatD20Resolution, resolveD20Check, resolveD20Hit, type RollMode } from './utils/d20';
 import {
   applyEquippedRuneSkillsToList,
   applyPaladinRuneResist,
@@ -94,6 +94,7 @@ import {
   appendEnemyCombatLog,
   wrapCombatLogPlayerBody,
 } from './utils/combatLogUi';
+import { chanceToD20Dc, formatD20Check, formatD20Resolution, resolveD20Check, resolveD20Hit, type RollMode } from './utils/d20';
 import { getDamageModifier, getArmorDodgeChance, getArmorGuardChance, getArmorSpeedText, type WeaponAttribute, type ArmorAttribute } from './data/attributes';
 import { JOB_LIST } from './data/jobClasses';
 import {
@@ -589,6 +590,13 @@ function getItemTooltip(
   if (statBase.requiredMastery) opts.push(`마스터리 Lv.${statBase.requiredMastery} 필요`);
   if (statBase.bonusCritChance) opts.push(`치명타 +${Math.round((statBase.bonusCritChance ?? 0) * 100)}%p`);
   if (statBase.bonusAccuracy) opts.push(`명중 +${Math.round((statBase.bonusAccuracy ?? 0) * 100)}%p`);
+  if (statBase.armorDefenseBonusByArmorAttr) {
+    (Object.entries(statBase.armorDefenseBonusByArmorAttr) as [ArmorAttribute, number][]).forEach(([attr, v]) => {
+      if (v == null || !Number.isFinite(v) || v <= 0) return;
+      const ko = attr === '사슬' ? '경갑' : attr;
+      opts.push(`${ko} 방어력 +${v}`);
+    });
+  }
   // 속성 저항(화염/빙결/전기/독) — 아이템 이름에 속성이 있어도 툴팁에 반드시 표시
   if (statBase.elementResist) {
     Object.entries(statBase.elementResist).forEach(([el, val]) => {
@@ -768,6 +776,7 @@ const App: React.FC = () => {
       joinedFaction: null as string | null,
       romancePartner: null as string | null,
       defeatedBosses: [] as string[],
+      dialogueFlags: {} as Record<string, boolean>,
       grantedMazeZone3FirstRune: false,
       runeRestoreUsedRoomIds: [] as string[],
     },
@@ -842,6 +851,8 @@ const App: React.FC = () => {
   const [scenePanelImgFailed, setScenePanelImgFailed] = useState(false);
   // 마지막으로 대화한 NPC ID를 추적 (선택 명령어에서 사용)
   const [lastTalkedNpc, setLastTalkedNpc] = useState<string | null>(null);
+  /** 데이터 기반 대화 분기 세션(선택지 번호 입력용) */
+  const [dialogueSession, setDialogueSession] = useState<null | { npcId: DialogueNpcId; nodeId: string }>(null);
   const [showMap, setShowMap] = useState<boolean>(false);
   /** 전체 구역 지도(미니맵과 별개) — M 단축키 / 헤더 버튼 / '구역지도' 명령 */
   const [showZoneMap, setShowZoneMap] = useState<boolean>(false);
@@ -1068,6 +1079,7 @@ const App: React.FC = () => {
         story: {
           ...char.story,
           defeatedBosses: char.story.defeatedBosses || [],
+          dialogueFlags: (char.story as any).dialogueFlags ?? {},
           grantedMazeZone3FirstRune: char.story.grantedMazeZone3FirstRune === true,
           runeRestoreUsedRoomIds: Array.isArray((char.story as { runeRestoreUsedRoomIds?: string[] }).runeRestoreUsedRoomIds)
             ? [...(char.story as { runeRestoreUsedRoomIds: string[] }).runeRestoreUsedRoomIds]
@@ -1766,7 +1778,16 @@ const App: React.FC = () => {
       : it.type === 'shield' ? 3
       : it.type === 'accessory' ? 2
       : 3;
-    return scaleCoinCost(base);
+    // 카르마: 경제에 소폭 영향(선의/명예) — 선하면 약간 할인, 악하면 약간 할증
+    const karma = playerState.story?.karma ?? 0;
+    const mult =
+      karma >= 20 ? 0.9
+      : karma >= 5 ? 0.95
+      : karma <= -20 ? 1.15
+      : karma <= -5 ? 1.05
+      : 1.0;
+    const scaled = scaleCoinCost(base);
+    return Math.max(1, Math.round(scaled * mult));
   };
 
   const getPlayerWeaponAttr = (): WeaponAttribute => {
@@ -1921,9 +1942,20 @@ const App: React.FC = () => {
     const playerShield = offHandItem?.type === 'shield' ? offHandItem : null;
     const armorDef = (playerArmor?.defense ?? 0) + (playerArmor?.bonusDefense ?? 0);
     const shieldDef = (playerShield?.defense ?? 0) + (playerShield?.bonusDefense ?? 0);
+    // 재질별 방어 보너스(악세/갑옷 감정 옵션): 현재 착용한 갑옷 재질 기준으로 추가 DEF 합산
+    const armorAttr = getPlayerArmorAttr();
+    let armorAttrBonusDef = 0;
+    equipSlots.forEach((slot) => {
+      if (isBroken(slot)) return;
+      const it = getMergedEquippedItem(slot, playerState.inventory);
+      if (!it?.armorDefenseBonusByArmorAttr) return;
+      const v = it.armorDefenseBonusByArmorAttr[armorAttr];
+      if (v == null || !Number.isFinite(v)) return;
+      armorAttrBonusDef += v;
+    });
     const conDefBonus = Math.floor(effCon * 0.5);
     const obDef = (playerState.obeliskDefTurns ?? 0) > 0 ? (playerState.obeliskDefBonus ?? 0) : 0;
-    let effDef = playerState.def + armorDef + shieldDef + conDefBonus + obDef;
+    let effDef = playerState.def + armorDef + shieldDef + armorAttrBonusDef + conDefBonus + obDef;
     const baseCrit = 0.1;
     const effCritChance = Math.min(0.5, baseCrit + bonusCritChance);
     const effAccuracy = bonusAccuracy;
@@ -2383,7 +2415,7 @@ const App: React.FC = () => {
       // 이 커맨드 처리 중 "전투가 시작됐는지"를 추적하는 플래그 (상태 업데이트 비동기로 인한 이중 전투 시작 방지)
       let combatStartedThisCommand = false;
       let response = '';
-      const input = cmd.trim();
+      let input = cmd.trim();
       const {
         effStr,
         effDex,
@@ -2435,6 +2467,84 @@ const App: React.FC = () => {
         ]);
         return { ...r, chance };
       };
+
+      // ─────────────────────────────────────────
+      // 데이터 기반 NPC 대화 분기 엔진
+      // WHY: 대사를 코드 if/else로 늘리면 유지보수가 급격히 어려워져서, 데이터로 정의하고 공통 처리한다.
+      // ─────────────────────────────────────────
+      const getDialogueTree = (npcId: string | null | undefined): DialogueTree | null => {
+        if (!npcId) return null;
+        return (DIALOGUE_TREES as any)[npcId] ?? null;
+      };
+
+      const evalDialogueCondition = (cond: DialogueCondition): boolean => {
+        if (cond.kind === 'hasSkill') return playerState.skills.includes(cond.skillName);
+        if (cond.kind === 'notHasSkill') return !playerState.skills.includes(cond.skillName);
+        if (cond.kind === 'minCredit') return (playerState.credit || 0) >= cond.amount;
+        if (cond.kind === 'minKarma') return (playerState.story?.karma ?? 0) >= cond.value;
+        if (cond.kind === 'maxKarma') return (playerState.story?.karma ?? 0) <= cond.value;
+        if (cond.kind === 'storyJoinedFactionIs') return (playerState.story?.joinedFaction ?? null) === cond.faction;
+        if (cond.kind === 'storyFlag') {
+          const flags = (playerState.story as any)?.dialogueFlags as Record<string, boolean> | undefined;
+          return (flags?.[cond.key] ?? false) === cond.value;
+        }
+        return true;
+      };
+
+      const listAvailableChoices = (node: DialogueNode): DialogueChoice[] => {
+        const raw = node.choices ?? [];
+        return raw.filter((c) => (c.conditions ?? []).every(evalDialogueCondition));
+      };
+
+      const formatDialogueNodeText = (npcId: DialogueNpcId, node: DialogueNode): string => {
+        const choices = listAvailableChoices(node);
+        const header = `[대화: ${npcId}]`;
+        const body = node.text;
+        if (choices.length === 0) return `${header}\n${body}`;
+        const lines = choices.map((c, idx) => `${idx + 1}. ${c.text}`);
+        return `${header}\n${body}\n\n${lines.join('\n')}\n\n(입력: 선택 1 — 또는 숫자만 1)`;
+      };
+
+      const applyDialogueEffects = (effects: DialogueEffect[] | undefined) => {
+        if (!effects || effects.length === 0) return;
+        setPlayerState((p) => {
+          let next: any = { ...p };
+          for (const ef of effects) {
+            if (ef.kind === 'storyFlagSet') {
+              const prevFlags = (next.story as any)?.dialogueFlags ?? {};
+              next.story = { ...next.story, dialogueFlags: { ...prevFlags, [ef.key]: ef.value } };
+            } else if (ef.kind === 'storyAddKarma') {
+              next.story = { ...next.story, karma: (next.story?.karma ?? 0) + ef.delta };
+            } else if (ef.kind === 'storyJoinFaction') {
+              next.story = { ...next.story, joinedFaction: ef.faction };
+            } else if (ef.kind === 'npcAddReputation') {
+              const prevNpc = next.npcs?.[ef.npcId] ?? { reputation: 0, relationship: 'Neutral', metBefore: false };
+              next.npcs = { ...(next.npcs ?? {}), [ef.npcId]: { ...prevNpc, reputation: (prevNpc.reputation ?? 0) + ef.delta } };
+            } else if (ef.kind === 'creditAdd') {
+              next.credit = (next.credit || 0) + ef.delta;
+            } else if (ef.kind === 'creditSpend') {
+              next.credit = Math.max(0, (next.credit || 0) - ef.amount);
+            } else if (ef.kind === 'skillAdd') {
+              if (!next.skills?.includes(ef.skillName)) next.skills = [...(next.skills ?? []), ef.skillName];
+            } else if (ef.kind === 'healToFull') {
+              next.hp = next.maxHp ?? next.hp;
+            } else if (ef.kind === 'questStart') {
+              next.quests = { ...(next.quests ?? { active: {}, completed: [] }), active: { ...(next.quests?.active ?? {}), [ef.questId]: 0 } };
+            }
+          }
+          return next;
+        });
+      };
+
+      // 데이터 대화 중에는 `1`만 쳐도 `선택 1`과 동일 (표시된 선택지가 있을 때만)
+      if (dialogueSession && lastTalkedNpc && /^\d+$/.test(input)) {
+        const tree = getDialogueTree(lastTalkedNpc);
+        const node = tree?.nodes?.[dialogueSession.nodeId];
+        if (node) {
+          const avail = listAvailableChoices(node);
+          if (avail.length > 0) input = `선택 ${input}`;
+        }
+      }
 
       // 턴 기반 쿨타임/상태 감소: "이번 커맨드 처리"가 시작될 때 1틱 줄인다.
       // WHY: 스킬 사용 직후(같은 커맨드) 바로 줄어드는 것처럼 보이는 문제를 피하기 위해,
@@ -3426,26 +3536,9 @@ const App: React.FC = () => {
               }
 
               // 기본 명중률: 적 ATK가 높을수록 약간 상승
-              let hitChance = Math.min(0.95, 0.75 + (enemy.atk / 500));
-              if (
-                plElevCombat >= 1 &&
-                enemy.weaponAttr !== '마법' &&
-                !isEnemyRangedStrike(enemy.attackPattern)
-              ) {
-                hitChance *= 0.83; // 아래서 위를 노리는 근접은 빗나가기 쉬움
-              }
-              // 플레이어가 빙결 상태일 때는 사실상 움직이지 못하므로, 적 입장에선 맞추기 훨씬 쉬워야 한다.
-              // 회피는 이미 막혀 있고, 여기서는 "완전한 빗나감" 확률만 줄여서 빙결 시 명중률 체감 강화.
-              if ((playerState.freezeTurns ?? 0) > 0) {
-                hitChance = Math.max(hitChance, 0.98); // 최소 98% 명중
-              }
-              if ((playerState.runeMirageTurns ?? 0) > 0) {
-                hitChance *= 0.72;
-              }
-              if ((playerState.thiefMirrorCorridorTurns ?? 0) > 0) {
-                hitChance *= 0.74; // 거울 복도: 홀로그램이 제3의 그림자로 적 시선을 돌린다
-              }
-
+              const effectiveAtkBuff = (enemyLive.atkBuffTurns ?? 0) > 0 ? (enemyLive.atkBuffBonus ?? 0) : 0;
+              const enemyAtkForHit = (enemyLive.atk + effectiveAtkBuff) * 1.0;
+              // 방어력(플레이어): 장비+CON 기반 총합을 사용해 “공격 vs 방어”로 명중률을 산출
               const playerArmor = isBroken(playerState.armor || '') ? null : getMergedEquippedItem(playerState.armor, playerState.inventory);
               const offHandForDef = isBroken(playerState.offHand || '') ? null : getMergedEquippedItem(playerState.offHand, playerState.inventory);
               const playerShield = offHandForDef?.type === 'shield' ? offHandForDef : null;
@@ -3468,31 +3561,26 @@ const App: React.FC = () => {
                 getEnchantStatBonusFromTierPlus(shieldEnchant.tier, shieldEnchant.plus);
               const totalPlayerDef = playerState.def + armorDef + shieldDef + conDefBonus;
 
-              // d20 명중 판정: 기존 hitChance를 DC로 변환해 가시화
-              const mode: RollMode =
-                (playerState.freezeTurns ?? 0) > 0
-                  ? 'adv'
-                  : (isDefending || isParrying || isRiposte)
-                    ? 'dis'
-                    : 'normal';
-              const dc = chanceToD20Dc(hitChance);
-              const r = resolveD20Check({ dc, mode });
-              setLogs((prev) =>
-                appendEnemyCombatLog(prev, [
-                  `🎯 적의 공격 명중 판정`,
-                  `공격력 ${Math.round(enemy.atk)} vs 방어력 ${Math.round(totalPlayerDef)} · 성공률 ${(hitChance * 100).toFixed(0)}% (환경 보정 포함)`,
-                  formatD20Check(r),
-                ].join('\n')),
-              );
-              if (!r.hit) {
-                pushEnemyCombatLine('💨 공격이 빗나갔습니다. (d20 판정)');
+              // d20 모드: 플레이어가 의식적으로 방어/패링/반격 태세면 적은 불리(디스), 플레이어가 빙결이면 적은 유리(어드)
+              const plFrozen = (playerState.freezeTurns ?? 0) > 0;
+              const defensiveStance = isDefending || isParrying || isRiposte;
+              const mode: RollMode = plFrozen ? 'adv' : defensiveStance ? 'dis' : 'normal';
+              const hitRes = resolveD20FromChance({
+                title: '적의 공격',
+                attackerAtk: enemyAtkForHit,
+                defenderDef: totalPlayerDef,
+                mode,
+              });
+              if (!hitRes.hit) {
+                pushEnemyCombatLine(
+                  `💨 [${enemy.name}]의 공격이 빗나갔습니다. (d20 판정)`,
+                );
                 setActiveEnemies(prev => prev.map(e => e.id === enemy.id ? { ...e, atkBuffTurns: Math.max(0, (e.atkBuffTurns ?? 0) - 1), atkBuffBonus: (e.atkBuffTurns ?? 0) <= 1 ? 0 : (e.atkBuffBonus ?? 0) } : e));
                 return;
               }
 
               const rand = 0.9 + Math.random() * 0.2;
-              const crit = r.crit || (Math.random() < 0.1);
-              const effectiveAtkBuff = (enemyLive.atkBuffTurns ?? 0) > 0 ? (enemyLive.atkBuffBonus ?? 0) : 0;
+              const crit = hitRes.crit;
               const baseDmg = ((enemyLive.atk + effectiveAtkBuff) * 0.8) + enemyLive.weaponDmg;
               const defFactor = (100 + enemyLive.str) / (100 + totalPlayerDef);
 
@@ -3924,7 +4012,11 @@ const App: React.FC = () => {
                   (enemyLive.isBoss ? HEAVY_ATTACK_QTE_CHANCE_BOSS : HEAVY_ATTACK_QTE_CHANCE_NORMAL);
               if (canHeavyQte) {
                 const hk: MiniBossQteKey[] = ['w', 'a', 's', 'd'];
-                const hSeq = [hk[Math.floor(Math.random() * 4)]!];
+                // 강공 대응 QTE: 난이도(보스/엘리트/일반 + 강공 배율)에 따라 3~5키로 증가
+                const baseLen = enemyLive.isBoss ? 5 : enemyLive.isMiniBoss ? 4 : 3;
+                const extra = heavyMult >= 1.28 ? 1 : 0;
+                const len = Math.max(3, Math.min(5, baseLen + extra));
+                const hSeq = Array.from({ length: len }, () => hk[Math.floor(Math.random() * 4)]!);
                 miniBossQteLockRef.current = true;
                 heavyStrikeQteEnemyIdRef.current = enemyLive.id;
                 heavyStrikeQteFailContinueRef.current = () => {
@@ -3935,7 +4027,7 @@ const App: React.FC = () => {
                 setHeavyStrikeQte({ enemyName: enemyLive.name, sequence: hSeq });
                 setLogs((prev) => [
                   ...prev,
-                  '⚡ [강공 대응] 간격이 좁아졌다! QTE로 회피를 시도하세요. (성공 시 회피, 실패 시 그대로 피해)',
+                  `⚡ [강공 대응] 간격이 좁아졌다! QTE ${len}회로 회피를 시도하세요. (전체 제한시간 20초 / 성공 시 회피, 실패 시 그대로 피해)`,
                 ]);
                 return;
               }
@@ -4541,7 +4633,7 @@ const App: React.FC = () => {
         response = lines.join('\n');
       } else if (['/?','도움말','헬프'].includes(input)) {
         response = `=== 명령어 목록 ===
-[설정] / [게임설정] / [백과] — 외부 공유용 요약(컨셉·전투·경제 수식·소스 맵, 코드가 최종 기준)
+[설정] / [게임설정] / [백과] — 외부 공유용 요약(컨셉·전투·경제 수식·소스 맵, 코드가 최종 기준). 장비 「각인」은 [5-B], 신경 룬은 [5-A]
 [스토리] / [목표] / [세계관] - 게임 스토리, 최종 목표, 현재 진행 상황 확인
 [이동 북/남/동/서] - 해당 방향으로 이동
 [위치] - 현재 위치 확인 및 로그의 직감 발동 (로그 직업)
@@ -4553,13 +4645,20 @@ const App: React.FC = () => {
 [인벤토리] - 보유 중인 아이템 확인 (최대 ${INVENTORY_MAX_SLOTS}칸 — 가득 차면 추가 획득 불가)
 [버리기 <아이템명>] - 아이템 1개: 상인 없이 인벤에서 제거 (크레딧 없음 · 장착 중만 남았으면 해제 후)
 [버리기 노멀] 등 (커먼/매직 · 노말=노멀) - [판매 ○○]과 동일하게 아이언 잭 거래 중일 때만, 물약·스킬북·잡동사니·장착분 제외한 해당 티어 장비만 일괄 판매 (레어·에픽은 일괄 불가)
-[장비 확인] - 장착 중인 무기/방어구/장신구의 옵션 및 스탯 보너스 확인
-[감정] / [감정 <미확인 장비 전체 이름>] - 물음표(?) 미확인 장비의 실명·부가 옵션(각인) 공개
+[장비 확인] - 장착 중인 무기/방어구/장신구의 기본 옵션·각인 줄(감정으로 붙은 랜덤 옵)·스탯 보너스 확인
+[감정] / [감정 <미확인 장비 전체 이름>] - 물음표(?) 미확인 장비의 실명 공개 + **각인**(랜덤 옵션 여러 줄) 굴림·고정
+[각인] - 장비 각인 개념·일반 풀 vs 베일 블라인드 전용 풀 요약 (실행은 아래와 같이 감정과 동일)
+[각인 <미확인 장비 전체 이름>] - [감정 …]과 완전히 동일
   · 예: 인벤에 보이는 그대로 — 감정 미확인 무기·abc12 / 이름만으로 여러 개 겹치면 더 길게 입력
   · [${APPRAISAL_SCROLL_ITEM_NAME}] 1매 보유 시, 어디서든 해당 명령으로 1회 감정(스크롤 소모)
-  · 스크롤 없음: 아이언 잭이 서비스하는 구역(슬럼 상점가·컨베이어·하수 미로·심층 미로 등)에서 잭과 거래·대화 연출 후 ${IRON_JACK_APPRAISAL_COST_COINS} C 유료 감정
-  · 미확인 상태에서는 [강화] 불가 — 감정 후 강화 가능 · 합산 스탯은 [장비 확인]·전투에 즉시 반영
+  · 스크롤 없음: 아이언 잭이 서비스하는 구역(슬럼 상점가·컨베이어·하수 미로·심층 미로 등)에서 잭과 거래·대화 연출 후 ${IRON_JACK_APPRAISAL_COST_COINS} C 유료 감정(카르마에 따라 수수료 소폭 변동)
+  · **베일 크립트 블라인드**에서 산 미확인만: 감정 시 **베일 전용 각인 풀**(문구·조합이 잭·스크롤 일반 풀과 별개)
+  · 미확인 상태에서는 [강화] 불가 — 감정 후 강화 가능 · 합산 스탯은 [장비 확인]·[인벤토리]·전투에 즉시 반영
   · [감정]만 치면 명령 형식·조건 요약이 다시 출력됨
+[룬] / [룬 목록] - 신경 룬(NEURAL RUNE) 14종 목록·장착 문법 안내 (※ 위 장비 「각인」과는 **다른** 시스템)
+[룬 장착 ○○○] / [equip_rune id] - 주 슬롯 룬 장착 (Lv.${RUNE_EQUIP_MIN_LEVEL} 이상, 미만이면 거부·해제는 항상 가능)
+[룬2 장착 ○○○] / [equip_rune2 id] - 보조 슬롯 룬 장착 (동일 레벨 조건)
+[룬 해제] / [룬2 해제] / [룬 전체 해제] - 주만·보조만·둘 다 해제
 [내구도] - 착용 중인 장비 내구도 확인 (0이면 파손)
 [수리] / [수리 무기/방어구/방패/장신구/전체] - 안전지대에서 장비 내구도 복구 (COIN 소모)
 [성벽] / [마을 방어] - 성벽·구역 거점 요약
@@ -4585,7 +4684,7 @@ const App: React.FC = () => {
 [판매 잡동사니] - 아이언 잭과 거래 중일 때, 잡동사니 일괄 판매
 [판매 무기] / [판매 갑옷] / [판매 반지] / [판매 목걸이] / [판매 물약] / [판매 스킬북] — 동일 조건에서 인벤의 해당 카테고리만 일괄 판매 (장착 중인 칸은 제외 · 레어·에픽은 제외)
 [판매 커먼] / [판매 노멀] / [판매 매직] — 무기·갑옷·방패·반지·목걸이를 카테고리 구분 없이 해당 등급(강화 승급 후 현재 티어)만 일괄 판매 (장착 제외 · 노말=노멀 · 레어·에픽은 개별 판매만)
-※ 홀로 거래소 [베일 크립트]: 미확인 장비만 파는 도박성 상인 — '거래 베일 크립트' 후 '구매 [상품명]' (실명·옵션은 구매 뒤 감정)
+※ 홀로 거래소 [베일 크립트]: 미확인 장비만 파는 도박성 상인 — '거래 베일 크립트' 후 '구매 [상품명]' (실명·각인은 구매 뒤 감정·**베일 전용 각인 풀**)
 
 [전투 명령어]
 [공격] / [공격 2] - 무기로 기본 공격 (숫자로 대상 지정: 공격 2 = 2번째 몬스터, 미지정 시 1번째)
@@ -5592,6 +5691,29 @@ const App: React.FC = () => {
               buildNeonRuneLog(rid, 'gain'),
             ]);
             response = `🔦 오래된 코어에서 룬 데이터가 재구성되었습니다.\n[${itemName}]을(를) 획득했습니다.`;
+          } else if (
+            currentRoom?.id === 'slum_s3e2s' &&
+            !discoveredHiddenExits.has('slum_s3e2s')
+          ) {
+            // 야적장 끝: 숨은 남쪽 출구 — 잠금 상자(ROOM_INT_LOCKED_CHESTS)보다 먼저 처리해야
+            // 첫 조사에서 상자 분기만 타고 searched만 찍여 통로를 영원히 못 여는 버그가 나지 않음.
+            // 이미 searched인 세이브도, 출구 미발견이면 여기서 복구 가능.
+            setDiscoveredHiddenExits((prev) => {
+              const next = new Set(prev);
+              next.add('slum_s3e2s');
+              return next;
+            });
+            response =
+              '🔦 벽면을 두드려 보니, 남쪽 벽 뒤에서 빈 공간의 울림이 느껴진다.\n' +
+              '조심스럽게 패널을 밀어내자, 아래로 내려가는 좁은 통로가 드러났다. (이제 [남]쪽으로 이동할 수 있습니다)';
+          } else if (alreadySearched) {
+            // 이미 수색한 구역: 더 이상 얻을 게 없음
+            const exhausted = [
+              '이미 샅샅이 뒤진 자리다. 더 이상 찾을 것이 없다.',
+              '쓸 만한 건 이미 챙겼다. 빈 컨테이너만 남아있다.',
+              '여기서 더 뒤져봤자 먼지뿐이다.',
+            ];
+            response = `🔦 ${exhausted[Math.floor(Math.random() * exhausted.length)]}`;
           } else if (ROOM_INT_LOCKED_CHESTS[currentRoomId]) {
             // 지능(INT) 판정이 필요한 잠금 상자/보관함
             const def = ROOM_INT_LOCKED_CHESTS[currentRoomId]!;
@@ -5665,18 +5787,10 @@ const App: React.FC = () => {
                     `🔦 잠금이 풀리며 보관함이 열렸다!\n` +
                     `💰 COIN +${def.reward.amount} (총 ${((playerState.credit || 0) + def.reward.amount)})`;
                 } else {
-                  response = '🔦 보관함을 열었다. (보상 정의 누락)';
+                  response = '🔦 보관함이 열렸다. (보상 정의 누락)';
                 }
               }
             }
-          } else if (alreadySearched) {
-            // 이미 수색한 구역: 더 이상 얻을 게 없음
-            const exhausted = [
-              '이미 샅샅이 뒤진 자리다. 더 이상 찾을 것이 없다.',
-              '쓸 만한 건 이미 챙겼다. 빈 컨테이너만 남아있다.',
-              '여기서 더 뒤져봤자 먼지뿐이다.',
-            ];
-            response = `🔦 ${exhausted[Math.floor(Math.random() * exhausted.length)]}`;
           } else if (ROOM_SEARCH_ITEMS[currentRoomId]) {
             // 특정 장소 전용: 이 방에서만 조사로 얻을 수 있는 퀘스트용 아이템 (1회만)
             const found = ROOM_SEARCH_ITEMS[currentRoomId];
@@ -5688,15 +5802,6 @@ const App: React.FC = () => {
             });
             setSearchedRooms(prev => new Set(prev).add(currentRoomId));
             response = `🔦 주변을 꼼꼼히 살펴보니...\n\n✨ ${currentRoom?.name ?? '이곳'}에서만 발견되는 [${found}]${getObjectParticle(found)} 발견했습니다!\n인벤토리에 추가되었습니다.`;
-          } else if (currentRoom?.id === 'slum_s3e2s') {
-            // 야적장 끝: 퍼즐형 숨겨진 출구 발견
-            setDiscoveredHiddenExits(prev => {
-              const next = new Set(prev);
-              next.add('slum_s3e2s');
-              return next;
-            });
-            setSearchedRooms(prev => new Set(prev).add(currentRoomId));
-            response = '🔦 벽면을 두드려 보니, 남쪽 벽 뒤에서 빈 공간의 울림이 느껴진다.\n조심스럽게 패널을 밀어내자, 아래로 내려가는 좁은 통로가 드러났다. (이제 [남]쪽으로 이동할 수 있습니다)';
           } else if (!currentRoom?.isSafe && Math.random() < 0.18) {
             // WHY: 구역 탐험 중 조사로 가끔 고대 비석을 발견하면 탐험 보상감이 생긴다.
             const lv = playerState.level;
@@ -6176,7 +6281,7 @@ const App: React.FC = () => {
             if (row.identified === false && row.mysteryItemId) {
               const ghost = getItemById(row.mysteryItemId);
               const hint = ghost ? getMysteryCategoryLabel(ghost) : '장비';
-              equipLogs.push(`❓ ${row.name}: 미확인 (${hint}). 감정 후 부가 옵션이 공개됩니다.`);
+              equipLogs.push(`❓ ${row.name}: 미확인 (${hint}). 감정 후 각인이 공개됩니다.`);
               return;
             }
             const item = getMergedEquippedItem(row.id, playerState.inventory);
@@ -6187,7 +6292,7 @@ const App: React.FC = () => {
             const gradeTagColored = colorizeItemGradeTag(baseForGrade, effectiveGrade ?? undefined);
             const affixSuffix =
               row.rolledAffixes && row.rolledAffixes.length > 0
-                ? `\n    └ 부가 옵션: ${row.rolledAffixes.map((a) => a.labelKo).join(' · ')}`
+                ? `\n    └ 각인: ${row.rolledAffixes.map((a) => a.labelKo).join(' · ')}`
                 : '';
             // WHY: 동일 이름이라도 인스턴스별 강화·감정 부가옵션이 다를 수 있어 행마다 표시
             if (item.type === 'weapon') {
@@ -6303,13 +6408,38 @@ const App: React.FC = () => {
             triggerEnemyTurn(activeEnemies, undefined, 'neutral');
           }
         }
-      } else if (input.startsWith('감정 ') || input === '감정') {
-        const arg = input === '감정' ? '' : input.slice(3).trim();
-        if (!arg) {
+      } else if (
+        input.startsWith('감정 ') ||
+        input === '감정' ||
+        input.startsWith('각인 ') ||
+        input === '각인'
+      ) {
+        const arg =
+          input === '감정' || input === '각인'
+            ? ''
+            : input.startsWith('감정 ')
+              ? input.slice(3).trim()
+              : input.slice(3).trim();
+        if (!arg && input === '각인') {
           response =
-            `감정할 미확인 장비의 전체 이름을 입력하세요. (예: 감정 미확인 무기·x7k2a)\n` +
+            `📜 === 각인 시스템 안내 ===\n` +
+            `「각인」은 **별도 아이템이 아니라**, 미확인 장비를 **감정할 때 그 장비 한 개에만 붙는 랜덤 옵션 여러 줄**(힘·방어·속성 등)을 말해요.\n` +
+            `[장비 확인]·[인벤토리]에는 **각인:** 이라고 적혀 나와요.\n\n` +
+            `🔹 **각인 종류(출처에 따라 다른 풀)**\n` +
+            `· **일반 각인**: 감정 스크롤 / 아이언 잭 유료 감정 / 일반 드랍 미확인 등 — 넓은 옵션 풀에서 굴림\n` +
+            `· **베일 각인**: 홀로 거래소 **베일 크립트 블라인드**에서 산 미확인만 — 감정 시 **전용 문구·조합**(도박장 느낌)으로 굴림. 잭이랑은 **완전히 다른 목록**이에요\n\n` +
+            `🔹 **쓰는 법**\n` +
+            `· \`감정 <미확인 전체 이름>\` 또는 \`각인 <같은 이름>\` — 동작은 같아요\n` +
+            `· 조건·COIN은 [감정]만 쳤을 때 나오는 안내와 같아요\n` +
+            `· 카리나 대사의「잭=확실한 강화 느낌 / 베일=도박 각인」은 **어느 풀에서 굴리느냐** 차이예요 (둘 다 한 번 감정할 때마다 주사위 굴림)\n` +
+            `· 명령 목록·예시는 [도움말], 긴 요약·룬과의 구분은 [설정]의 [5-B]·[5-A]를 보세요.`;
+        } else if (!arg) {
+          response =
+            `감정할 미확인 장비의 전체 이름을 입력하세요. (예: 감정 미확인 무기·x7k2a / 각인 …도 동일)\n` +
+            `※ 감정으로 붙는 줄들이 곧 **각인**이에요. 개념만 보려면 [각인]만 입력하세요.\n` +
             `조건: [${APPRAISAL_SCROLL_ITEM_NAME}] 1매 보유 시 어디서든 소모 감정, 또는 아이언 잭이 있는 곳(슬럼 상점가·컨베이어·하수 미로·심층 maze_* 등)에서 잭과 대화 후 ` +
-            `${IRON_JACK_APPRAISAL_COST_COINS} C 유료 감정.`;
+            `${IRON_JACK_APPRAISAL_COST_COINS} C 유료 감정. (카르마에 따라 수수료가 소폭 변동)\n` +
+            `베일 크립트 블라인드 출처 미확인은 감정 시 **베일 전용 각인 풀** — [도움말]·[설정] [5-B] 참고.`;
         } else {
           const candidates = playerState.inventory.filter(
             (r) =>
@@ -6333,14 +6463,22 @@ const App: React.FC = () => {
               const jackNpcOk =
                 isIronJackServiceRoom(currentRoomId) && lastTalkedNpc === 'ironJack';
               const credit = playerState.credit || 0;
+              const karma = playerState.story?.karma ?? 0;
+              const feeMult =
+                karma >= 20 ? 0.9
+                : karma >= 5 ? 0.95
+                : karma <= -20 ? 1.15
+                : karma <= -5 ? 1.05
+                : 1.0;
+              const jackFee = Math.max(1, Math.round(IRON_JACK_APPRAISAL_COST_COINS * feeMult));
               if (!hasScroll && !jackNpcOk) {
                 response =
                   `감정할 수 없습니다. [${APPRAISAL_SCROLL_ITEM_NAME}]을(를) 구비하거나, ` +
                   `아이언 잭이 지나는 구역(슬럼 상점가·미로 계열 등)에서 잭과 대화(거래)한 뒤 같은 명령으로 오세요. ` +
-                  `(잭 수수료: ${IRON_JACK_APPRAISAL_COST_COINS} C / 스크롤은 잭 상점에서 구매)`;
-              } else if (!hasScroll && jackNpcOk && credit < IRON_JACK_APPRAISAL_COST_COINS) {
+                  `(잭 수수료: ${jackFee} C / 스크롤은 잭 상점에서 구매)`;
+              } else if (!hasScroll && jackNpcOk && credit < jackFee) {
                 response =
-                  `COIN이 부족합니다. (아이언 잭 감정: ${IRON_JACK_APPRAISAL_COST_COINS} C 필요, 보유 ${credit} C) ` +
+                  `COIN이 부족합니다. (아이언 잭 감정: ${jackFee} C 필요, 보유 ${credit} C) ` +
                   `또는 [${APPRAISAL_SCROLL_ITEM_NAME}]을(를) 사용하세요.`;
               } else {
                 const { lines, combatTags } = rollAppraisalAffixes(
@@ -6372,20 +6510,20 @@ const App: React.FC = () => {
                     const rm = nextInv.findIndex((r) => invName(r) === APPRAISAL_SCROLL_ITEM_NAME);
                     if (rm >= 0) nextInv = nextInv.filter((_, i) => i !== rm);
                   } else {
-                    nextCredit -= IRON_JACK_APPRAISAL_COST_COINS;
+                    nextCredit -= jackFee;
                   }
                   return { ...p, inventory: nextInv, credit: nextCredit };
                 });
                 const linesStr = lines.map((l) => `  · ${l.labelKo}`).join('\n');
                 const costLine = usedScroll
                   ? `${APPRAISAL_SCROLL_ITEM_NAME} 1매를 소모했습니다.`
-                  : `아이언 잭에게 ${IRON_JACK_APPRAISAL_COST_COINS} C를 지불했습니다.`;
+                  : `아이언 잭에게 ${jackFee} C를 지불했습니다.`;
                 const ilvLine =
                   identifiedInstanceLevel != null
                     ? `\n인스턴스 레벨: Lv.${identifiedInstanceLevel} (동일 이름 장비라도 피해·방어 수치가 달라질 수 있음)`
                     : '';
                 response =
-                  `🔍 감정 완료! (${costLine})\n실체: [${base.name}]${ilvLine}\n부가 옵션:\n${linesStr}\n(합산 스탯은 [장비 확인]·전투에 즉시 반영됩니다.)`;
+                  `🔍 감정 완료! (${costLine})\n실체: [${base.name}]${ilvLine}\n붙은 각인:\n${linesStr}\n(합산 스탯은 [장비 확인]·전투에 즉시 반영됩니다.)`;
                 triggerEnemyTurn(activeEnemies, undefined, 'neutral');
               }
             }
@@ -6990,15 +7128,9 @@ const App: React.FC = () => {
           } else {
           const target = activeEnemies[targetIndex];
           const targetDisplayName = formatEnemyName(target);
-          const hitRes = resolveD20FromChance({
-            title: '플레이어',
-            attackerAtk: effAtk ?? 1,
-            defenderDef: effectiveEnemyDefForPhysical(target),
-            mode: 'normal',
-          });
-          setLogs((prev) => [...prev, formatD20Check(hitRes)]);
-          if (!hitRes.hit) {
-            response = `💨 공격이 빗나갔습니다! (d20 판정) [대상: ${targetDisplayName}]`;
+          const hitChance = Math.min(0.95, 0.8 + (effAtk / 500) + (effAccuracy ?? 0));
+          if (Math.random() > hitChance) {
+            response = `💨 공격이 빗나갔습니다! (명중률: ${Math.round(hitChance*100)}%) [대상: ${targetDisplayName}]`;
             triggerEnemyTurn(activeEnemies);
           } else {
             // 파손 무기면 공격 불가(빈손 공격 방지) — 수리로 복구 유도
@@ -7198,10 +7330,23 @@ const App: React.FC = () => {
 
             let totalDmg = 0;
             const hitLogs: string[] = [];
-            let isCritFinal = hitRes.crit;
+            let isCritFinal = false;
             const hitParts: HitPart[] = [];
             const hadMarkAtStart = !!target.warriorMarkActive;
             let markConsumedThisAttack = false;
+
+            // 다타(단검 연타·활 2연사·쌍단검): 명중은 첫 타만 d20 판정 — 성공 시 나머지 타는 자동 명중
+            const targetDefForHit = effectiveEnemyDefForPhysical(target);
+            const attackerAtkForHit = effAtk * (1 + (effAccuracy || 0));
+            const incapacitatedTarget = (target.stunTurns ?? 0) > 0 || (target.freezeTurns ?? 0) > 0 || (target.sleepTurns ?? 0) > 0;
+            const impairedAttacker = (playerState.freezeTurns ?? 0) > 0 || (playerState.staggerTurns ?? 0) > 0;
+            const mode: RollMode = incapacitatedTarget ? 'adv' : impairedAttacker ? 'dis' : 'normal';
+            const firstHitRes = resolveD20FromChance({
+              title: hits > 1 ? `나의 공격 (${hits}타)` : '나의 공격',
+              attackerAtk: attackerAtkForHit,
+              defenderDef: targetDefForHit,
+              mode,
+            });
 
             for (let i = 0; i < hits; i++) {
               // 마지막 타가 쌍단검 보조손일 때는 보조 무기 데미지 사용
@@ -7214,8 +7359,24 @@ const App: React.FC = () => {
               const rollMax = useOffHand ? Math.max(offHandAdjustedMin, offHandAdjustedMax) : finalMax;
 
               const rolledWeaponDmg = Math.floor(Math.random() * (rollMax - rollMin + 1)) + rollMin;
-              const critChance = Math.min(0.6, (effCritChance ?? 0.1) + optionFx.critBonus);
-              const hitCrit = bloodSlaughter || Math.random() < critChance;
+
+              if (!firstHitRes.hit) {
+                const partMiss = pickHitPart();
+                hitParts.push(partMiss);
+                // 다타는 명중 판정 1번이므로 MISS 로그는 한 줄로 묶음
+                if (hits > 1 && i > 0) {
+                  continue;
+                }
+                const fum = firstHitRes.fumble ? '(1)' : '';
+                hitLogs.push(
+                  hits > 1
+                    ? `${hits}연타 전부 MISS${fum} (첫 판정 기준)`
+                    : `${partMiss}:MISS${fum}${useOffHand ? '(보)' : ''}`,
+                );
+                continue;
+              }
+
+              const hitCrit = bloodSlaughter || firstHitRes.crit;
               if (hitCrit) isCritFinal = true;
 
               const critMult = hitCrit ? effPhysCritMult : 1.0;
@@ -7585,6 +7746,19 @@ const App: React.FC = () => {
           if (questResponse) {
              response = questResponse;
           } else {
+            // 데이터 기반 대화 트리(분기)가 있으면 우선 적용
+            const tree = getDialogueTree(npc.id);
+            if (tree) {
+              const start = tree.nodes[tree.startNodeId];
+              if (start) {
+                setDialogueSession({ npcId: tree.npcId, nodeId: start.id });
+                response = formatDialogueNodeText(tree.npcId, start);
+                speakDialogue(start.text, npc.id);
+              } else {
+                setDialogueSession(null);
+                response = `[${npc.name}] 대화 데이터가 손상되었습니다. (start node 없음)`;
+              }
+            } else {
              if (npc.id === 'oni') {
                const line = state.metBefore ? `또 왔나. 제로 코드는 가져왔겠지?` : `이 몸이 쿠로사키 오니다. 제로 코드 냄새가 나는군.`;
                response = `[쿠로사키 오니]: "${line}" ('선택 코드주기' / '선택 가입')`;
@@ -7626,6 +7800,7 @@ const App: React.FC = () => {
             speakDialogue(line, npc.id);
           }
         }
+          }
           setLastTalkedNpc(npc.id);
           setPlayerState(p => ({
             ...p,
@@ -7781,7 +7956,7 @@ const App: React.FC = () => {
                 `🎰 [베일 크립트] "${blind.purchaseName}" 거래 완료! (-${blindCost} C, 남은 COIN: ${left} C)\n` +
                 (scrapLine ? `${scrapLine}\n` : '') +
                 (jackpotLine ? `${jackpotLine}\n` : '') +
-                `📦 인벤에 미확인 장비가 들어왔다: [${mysteryRow.name}] — 부가 옵션·실명은 ` +
+                `📦 인벤에 미확인 장비가 들어왔다: [${mysteryRow.name}] — 각인·실명은 ` +
                 `'감정 ${mysteryRow.name}' 또는 [${APPRAISAL_SCROLL_ITEM_NAME}] / 아이언 잭 유료 감정으로 연다.`;
             }
           }
@@ -7815,6 +7990,14 @@ const App: React.FC = () => {
           }
         } else if (lastTalkedNpc === 'jin') {
           // WHY: 상점 표기와 동일하게 마스터 진 스킬 전체 가격을 10배로 통일해, 한 번에 풀셋 구매가 어렵도록 난이도 조정.
+          const karma = playerState.story?.karma ?? 0;
+          const karmaMult =
+            karma >= 20 ? 0.9
+            : karma >= 5 ? 0.95
+            : karma <= -20 ? 1.15
+            : karma <= -5 ? 1.05
+            : 1.0;
+          const coinCost = (base: number) => Math.max(1, Math.round(scaleCoinCost(base) * karmaMult));
           const allSkills = [
               {name: '마나 실드', price: 1000},
               {name: '아이스 스피어', price: 1000}, {name: '메테오 스트라이크', price: 3000}, {name: '블리자드', price: 2000},
@@ -7842,8 +8025,8 @@ const App: React.FC = () => {
              const isRegen = isRegenPassive(passiveDef.id);
              const currentLevel = (playerState.passiveLevels || {})[passiveDef.id] ?? 0;
              const regenCurrentLevel = isRegen ? (currentLevel >= 1 ? currentLevel : (playerState.passiveSkills || []).includes(passiveDef.id) ? 1 : 0) : 0;
-             const regenPrice = isRegen ? scaleCoinCost(getRegenUpgradePrice(regenCurrentLevel)) : 0;
-             const resistOrPassiveBuy = scaleCoinCost(passiveDef.price);
+             const regenPrice = isRegen ? coinCost(getRegenUpgradePrice(regenCurrentLevel)) : 0;
+             const resistOrPassiveBuy = coinCost(passiveDef.price);
              if (isResist && currentLevel >= MAX_RESIST_LEVEL) {
                response = `[${passiveDef.name}]은(는) 이미 최대 레벨(Lv.${MAX_RESIST_LEVEL})이다.`;
              } else if (isRegen && regenCurrentLevel >= REGEN_MAX_LEVEL) {
@@ -7883,10 +8066,10 @@ const App: React.FC = () => {
             response = `스킬 정보를 찾을 수 없습니다. (스킬명: ${skillName})`;
          } else if (playerState.skills.includes(skillName)) {
              response = `이미 [${skillName}]의 깨달음을 얻었거늘, 또 읽을 작정인가?\n(업그레이드는 '스킬강화 ${skillName}' 명령으로 스킬 레벨을 올리세요.)`;
-          } else if (playerState.credit < scaleCoinCost(skillDef.price)) {
-             response = `크레딧이 부족하다. (필요: ${scaleCoinCost(skillDef.price)} C / 보유: ${playerState.credit} C)`;
+         } else if (playerState.credit < coinCost(skillDef.price)) {
+             response = `크레딧이 부족하다. (필요: ${coinCost(skillDef.price)} C / 보유: ${playerState.credit} C)`;
           } else {
-             const skillBuy = scaleCoinCost(skillDef.price);
+             const skillBuy = coinCost(skillDef.price);
              setPlayerState(p => ({
                ...p,
                credit: p.credit - skillBuy,
@@ -8087,33 +8270,66 @@ const App: React.FC = () => {
           if (!playerState.isCombat || activeEnemies.length === 0) { response = '전투 중이 아닙니다.'; }
           else if (playerState.mp < smp(5)) { response = `MP 부족 (${smp(5)} MP 필요)`; }
           else {
-            const target = activeEnemies[0];
+            const targetId = activeEnemies[0].id;
+            const targetSnap = activeEnemies[0];
             const weaponAttr = getPlayerWeaponAttr();
-            const attrModifier = getDamageModifier(weaponAttr, target.armorAttr);
+            const attrModifier = getDamageModifier(weaponAttr, targetSnap.armorAttr);
             const wpPenalty = getWeaponPenalty();
             // 마법 데미지는 INT(최대 데미지)와 SPR(최소 데미지 보정)의 영향을 받음. 스킬 강화 레벨당 10% 증폭
             const magicBaseDmgBase = (effAtk * 1.8) + (effInt * 2.4) + (effSpr * 0.6);
             const magicRand = 0.85 + Math.random() * 0.3;
             const skillLv = (playerState.skillLevels || {})['매직 미사일'] || 1;
-            const dmg = Math.max(1, Math.round(magicBaseDmgBase * magicRand * ((100 + effStr) / (100 + target.def)) * attrModifier * wpPenalty * (1 + (skillLv - 1) * 0.1)));
-            const newHp = target.currentHp - dmg;
+            const dmg = Math.max(
+              1,
+              Math.round(
+                magicBaseDmgBase *
+                  magicRand *
+                  ((100 + effStr) / (100 + targetSnap.def)) *
+                  attrModifier *
+                  wpPenalty *
+                  (1 + (skillLv - 1) * 0.1),
+              ),
+            );
             setPlayerState(p => ({ ...p, mp: p.mp - smp(5), ...mergeSkillCooldown(p, '매직 미사일') }));
             playSoundMagic();
-            if (newHp <= 0) {
-              response = handleEnemiesDefeat([target], `✨ [매직 미사일] 적중! [${target.name}] 撃破! (-${dmg})`);
-              const remain = activeEnemies.filter((_, i) => i !== 0);
-              setActiveEnemies(remain);
+            const mmOut: { defeated: boolean; nh: number; maxHp: number; snap: ActiveEnemy; survivors: ActiveEnemy[] } =
+              {
+                defeated: false,
+                nh: 0,
+                maxHp: targetSnap.maxHp,
+                snap: targetSnap,
+                survivors: [],
+              };
+            setActiveEnemies((prev) => {
+              const live = prev.find((e) => e.id === targetId);
+              if (!live) return prev;
+              const nh = live.currentHp - dmg;
+              mmOut.nh = nh;
+              mmOut.maxHp = live.maxHp;
+              mmOut.snap = live;
+              if (nh <= 0) {
+                mmOut.defeated = true;
+                mmOut.survivors = prev.filter((e) => e.id !== targetId);
+                return mmOut.survivors;
+              }
+              return prev.map((e) => (e.id === targetId ? { ...e, currentHp: nh, sleepTurns: 0 } : e));
+            });
+            if (mmOut.defeated) {
+              response = handleEnemiesDefeat(
+                [{ ...mmOut.snap, currentHp: 0 }],
+                `✨ [매직 미사일] 적중! [${mmOut.snap.name}] 撃破! (-${dmg})`,
+              );
+              const remain = mmOut.survivors;
               if (remain.length > 0) {
                 setTimeout(() => triggerEnemyTurn(remain), 300);
               } else {
                 stealthTurnsRef.current = 0;
-                setPlayerState(p => ({...p, isCombat: false, stealthTurnsLeft: 0}));
+                setPlayerState(p => ({ ...p, isCombat: false, stealthTurnsLeft: 0 }));
                 setSceneImage(BG_ALLEY);
                 combatEndedThisCommand = true;
               }
             } else {
-              setActiveEnemies(prev => prev.map((e, index) => index===0 ? {...e, currentHp: newHp, sleepTurns: 0} : e));
-              response = `✨ [매직 미사일] [${target.name}]에게 ${dmg} 마법 데미지! (HP: ${newHp}/${target.maxHp})`;
+              response = `✨ [매직 미사일] [${mmOut.snap.name}]에게 ${dmg} 마법 데미지! (HP: ${mmOut.nh}/${mmOut.maxHp})`;
               triggerEnemyTurn(activeEnemies);
             }
           }
@@ -8298,7 +8514,8 @@ const App: React.FC = () => {
           else if (playerState.mp < smp(12)) { response = `MP 부족 (${smp(12)} MP 필요)`; }
           else {
             setPlayerState(p => ({ ...p, mp: p.mp - smp(12), ...mergeSkillCooldown(p, '사이버 클로') }));
-            const target = activeEnemies[0];
+            const targetId = activeEnemies[0].id;
+            const targetSnap = activeEnemies[0];
             const optionFx = getWeaponOptionEffects(
           resolveSlotToItemName(playerState.weapon, playerState.inventory),
           getWeaponCombatTagsFromSlot(playerState.weapon, playerState.inventory)
@@ -8309,8 +8526,8 @@ const App: React.FC = () => {
             const maxWp = weapon?.maxDamage ?? 3;
             const finalMin = minWp + Math.floor((effDex || 10) * 0.3);
             const finalMax = maxWp + Math.floor((effStr || 10) * 0.6);
-            const attrModifier = getDamageModifier(weaponAttr, target.armorAttr);
-            const defFactorVal = (100 + effStr) / (100 + target.def);
+            const attrModifier = getDamageModifier(weaponAttr, targetSnap.armorAttr);
+            const defFactorVal = (100 + effStr) / (100 + targetSnap.def);
             const statBonus = weaponAttr === '피어싱' ? effDex : effStr;
             const wpPenalty = getWeaponPenalty();
             const rolledWp = Math.floor(Math.random() * (finalMax - finalMin + 1)) + finalMin;
@@ -8325,13 +8542,36 @@ const App: React.FC = () => {
             const hit2 = Math.max(1, Math.round(multiHitBase * defFactorVal * attrModifier * wpPenalty * (c2 ? 1.5 : 1.0) * optionFx.damageMult));
             const hit3 = Math.max(1, Math.round(multiHitBase * defFactorVal * attrModifier * wpPenalty * (c3 ? 1.5 : 1.0) * optionFx.damageMult));
             const totalDmg = hit1 + hit2 + hit3;
-            const newHp = target.currentHp - totalDmg;
-            if (newHp <= 0) {
-              const anyCrit = c1 || c2 || c3;
-              const critFlavor = anyCrit ? `\n\u001b[91m💥 적의 심장을 꿰뚫는 치명적인 일격!\u001b[0m` : '';
-              response = handleEnemiesDefeat([target], `🐾 [사이버 클로] 3연타! (${parts[0]}:${hit1}${c1 ? '!' : ''} + ${parts[1]}:${hit2}${c2 ? '!' : ''} + ${parts[2]}:${hit3}${c3 ? '!' : ''} = ${totalDmg})${critFlavor}\n(${weaponAttr} vs ${target.armorAttr} x${attrModifier}) [${formatEnemyName(target)}] 撃破!`);
-              const remain = activeEnemies.filter((_, i) => i !== 0);
-              setActiveEnemies(remain);
+            const clawOut: { defeated: boolean; nh: number; maxHp: number; snap: ActiveEnemy; survivors: ActiveEnemy[] } =
+              {
+                defeated: false,
+                nh: 0,
+                maxHp: targetSnap.maxHp,
+                snap: targetSnap,
+                survivors: [],
+              };
+            setActiveEnemies((prev) => {
+              const live = prev.find((e) => e.id === targetId);
+              if (!live) return prev;
+              const nh = live.currentHp - totalDmg;
+              clawOut.nh = nh;
+              clawOut.maxHp = live.maxHp;
+              clawOut.snap = live;
+              if (nh <= 0) {
+                clawOut.defeated = true;
+                clawOut.survivors = prev.filter((e) => e.id !== targetId);
+                return clawOut.survivors;
+              }
+              return prev.map((e) => (e.id === targetId ? { ...e, currentHp: nh, sleepTurns: 0 } : e));
+            });
+            const anyCrit = c1 || c2 || c3;
+            const critFlavor = anyCrit ? `\n\u001b[91m💥 적의 심장을 꿰뚫는 치명적인 일격!\u001b[0m` : '';
+            if (clawOut.defeated) {
+              response = handleEnemiesDefeat(
+                [{ ...clawOut.snap, currentHp: 0 }],
+                `🐾 [사이버 클로] 3연타! (${parts[0]}:${hit1}${c1 ? '!' : ''} + ${parts[1]}:${hit2}${c2 ? '!' : ''} + ${parts[2]}:${hit3}${c3 ? '!' : ''} = ${totalDmg})${critFlavor}\n(${weaponAttr} vs ${clawOut.snap.armorAttr} x${attrModifier}) [${formatEnemyName({ ...clawOut.snap, currentHp: 0 })}] 撃破!`,
+              );
+              const remain = clawOut.survivors;
               if (remain.length > 0) {
                 setTimeout(() => triggerEnemyTurn(remain), 300);
               } else {
@@ -8341,10 +8581,9 @@ const App: React.FC = () => {
                 combatEndedThisCommand = true;
               }
             } else {
-              setActiveEnemies(prev => prev.map((e, index) => index === 0 ? {...e, currentHp: newHp, sleepTurns: 0} : e));
-              const anyCrit = c1 || c2 || c3;
-              const critFlavor = anyCrit ? `\n\u001b[91m💥 적의 심장을 꿰뚫는 치명적인 일격!\u001b[0m` : '';
-              response = `🐾 [사이버 클로] 3연타! (${parts[0]}:${hit1}${c1 ? '!' : ''} + ${parts[1]}:${hit2}${c2 ? '!' : ''} + ${parts[2]}:${hit3}${c3 ? '!' : ''} = ${totalDmg})${critFlavor}\n[대상: ${formatEnemyName({ ...target, currentHp: newHp })}] HP: ${newHp}/${target.maxHp}`;
+              response =
+                `🐾 [사이버 클로] 3연타! (${parts[0]}:${hit1}${c1 ? '!' : ''} + ${parts[1]}:${hit2}${c2 ? '!' : ''} + ${parts[2]}:${hit3}${c3 ? '!' : ''} = ${totalDmg})${critFlavor}\n` +
+                `[대상: ${formatEnemyName({ ...clawOut.snap, currentHp: clawOut.nh })}] HP: ${clawOut.nh}/${clawOut.maxHp}`;
               triggerEnemyTurn(activeEnemies);
             }
           }
@@ -8553,6 +8792,20 @@ const App: React.FC = () => {
           else {
             setPlayerState(p => ({ ...p, mp: p.mp - smp(8), ...mergeSkillCooldown(p, '데이터 도둑') }));
             const target = activeEnemies[0];
+            const incapacitatedTarget = (target.stunTurns ?? 0) > 0 || (target.freezeTurns ?? 0) > 0 || (target.sleepTurns ?? 0) > 0;
+            const impairedAttacker = (playerState.freezeTurns ?? 0) > 0 || (playerState.staggerTurns ?? 0) > 0;
+            const mode: RollMode = incapacitatedTarget ? 'adv' : impairedAttacker ? 'dis' : 'normal';
+            const hitRes = resolveD20FromChance({
+              title: '스킬: 데이터 도둑',
+              attackerAtk: effAtk * (1 + (effAccuracy || 0)),
+              defenderDef: target.def,
+              mode,
+            });
+            if (!hitRes.hit) {
+              response = `📡 [데이터 도둑] 접근했지만 허공을 뜯었다… (MISS)\n${formatEnemyName(target)}는 반격 자세를 잡는다.`;
+              triggerEnemyTurn(activeEnemies);
+              return;
+            }
             const optionFx = getWeaponOptionEffects(
           resolveSlotToItemName(playerState.weapon, playerState.inventory),
           getWeaponCombatTagsFromSlot(playerState.weapon, playerState.inventory)
@@ -8571,8 +8824,7 @@ const App: React.FC = () => {
             const wpPenalty = getWeaponPenalty();
             const statBonus = weaponAttr === '피어싱' ? playerState.dex : playerState.str;
             const basePart = (playerState.atk * 0.5) + rolledWp + (statBonus * 0.4);
-            const critChance = Math.min(0.6, (effCritChance ?? 0.1) + optionFx.critBonus);
-            const isCrit = Math.random() < critChance;
+            const isCrit = hitRes.crit;
             const critMult = magCritMult(isCrit);
             const dmg = Math.max(1, Math.round(basePart * ((100 + playerState.str) / (100 + target.def)) * attrModifier * wpPenalty * critMult * optionFx.damageMult));
             const newHp = target.currentHp - dmg;
@@ -8596,6 +8848,20 @@ const App: React.FC = () => {
           else {
             setPlayerState(p => ({ ...p, mp: p.mp - smp(25), ...mergeSkillCooldown(p, '라이트닝 볼트') }));
             const target = activeEnemies[0];
+            const incapacitatedTarget = (target.stunTurns ?? 0) > 0 || (target.freezeTurns ?? 0) > 0 || (target.sleepTurns ?? 0) > 0;
+            const impairedAttacker = (playerState.freezeTurns ?? 0) > 0 || (playerState.staggerTurns ?? 0) > 0;
+            const mode: RollMode = incapacitatedTarget ? 'adv' : impairedAttacker ? 'dis' : 'normal';
+            const hitRes = resolveD20FromChance({
+              title: '스킬: 라이트닝 볼트',
+              attackerAtk: (effAtk + effInt * 0.6) * (1 + (effAccuracy || 0)),
+              defenderDef: target.def,
+              mode,
+            });
+            if (!hitRes.hit) {
+              response = `⚡ [라이트닝 볼트] 전격이 빗나가 허공을 갈랐습니다. (MISS)\n[대상: ${formatEnemyName(target)}]`;
+              triggerEnemyTurn(activeEnemies);
+              return;
+            }
             const optionFx = getWeaponOptionEffects(
           resolveSlotToItemName(playerState.weapon, playerState.inventory),
           getWeaponCombatTagsFromSlot(playerState.weapon, playerState.inventory)
@@ -8604,8 +8870,7 @@ const App: React.FC = () => {
             const weaponAttr = getPlayerWeaponAttr();
             const wpPenalty = getWeaponPenalty();
             const magicBaseDmgBase = (effAtk * 3.5) + (effInt * 4) + (effSpr * 1);
-            const critChance = Math.min(0.6, (effCritChance ?? 0.1) + optionFx.critBonus);
-            const isCrit = Math.random() < critChance;
+            const isCrit = hitRes.crit;
             const critMult = magCritMult(isCrit);
             const dmg = Math.max(1, Math.round(magicBaseDmgBase * ((100 + effStr) / (100 + target.def)) * getDamageModifier(weaponAttr, target.armorAttr) * wpPenalty * critMult * optionFx.damageMult));
             const newHp = target.currentHp - dmg;
@@ -8693,6 +8958,21 @@ const App: React.FC = () => {
           else if (playerState.mp < smp(12)) { response = `MP 부족 (${smp(12)} MP 필요)`; }
           else {
             const target = activeEnemies[0];
+            const incapacitatedTarget = (target.stunTurns ?? 0) > 0 || (target.freezeTurns ?? 0) > 0 || (target.sleepTurns ?? 0) > 0;
+            const impairedAttacker = (playerState.freezeTurns ?? 0) > 0 || (playerState.staggerTurns ?? 0) > 0;
+            const mode: RollMode = incapacitatedTarget ? 'adv' : impairedAttacker ? 'dis' : 'normal';
+            const hitRes = resolveD20FromChance({
+              title: '스킬: 아이스 스피어',
+              attackerAtk: (effAtk + effInt * 0.5) * (1 + (effAccuracy || 0)),
+              defenderDef: target.def,
+              mode,
+            });
+            if (!hitRes.hit) {
+              setPlayerState(p => ({ ...p, mp: p.mp - smp(12), ...mergeSkillCooldown(p, '아이스 스피어') }));
+              response = `❄️ [아이스 스피어] 얼음 창이 빗나갔습니다. (MISS)\n[대상: ${formatEnemyName(target)}]`;
+              triggerEnemyTurn(activeEnemies);
+              return;
+            }
             const dmg = Math.max(1, Math.round(((effAtk * 1.5) + (effInt * 2.5)) * ((100 + effStr) / (100 + target.def))));
             const newHp = target.currentHp - dmg;
             setPlayerState(p => ({ ...p, mp: p.mp - smp(12), ...mergeSkillCooldown(p, '아이스 스피어') }));
@@ -10190,6 +10470,18 @@ const App: React.FC = () => {
           if (npc) {
             // 이미지창에 NPC 이미지 표시 (미스테리오 등)
             setSceneImage(resolveNpcSceneImage(npc.id));
+            // 데이터 기반 대화 세션이 있으면 현재 노드를 다시 보여준다
+            if (dialogueSession && dialogueSession.npcId === (npc.id as any)) {
+              const tree = getDialogueTree(npc.id);
+              const node = tree?.nodes?.[dialogueSession.nodeId];
+              if (tree && node) {
+                response = formatDialogueNodeText(tree.npcId, node);
+                speakDialogue(node.text, npc.id);
+                // 아래 퀘스트/기본 대사 분기 스킵
+              } else {
+                setDialogueSession(null);
+              }
+            }
             // Check for quest dialogue first
             const applicableQuest = Object.values(QUESTS).find(q =>
               q.npcId === npc.id &&
@@ -10237,59 +10529,65 @@ const App: React.FC = () => {
                     speakNarration("수락할 퀘스트가 없습니다.");
                 }
             }
+        } else if (npcId && dialogueSession && dialogueSession.npcId === (npcId as any)) {
+          // 데이터 기반 대화 분기: 선택지 번호/키워드 처리
+          const tree = getDialogueTree(npcId);
+          const node = tree?.nodes?.[dialogueSession.nodeId];
+          if (!tree || !node) {
+            setDialogueSession(null);
+            response = '대화 세션이 만료되었습니다. 다시 대화해 주세요.';
+          } else {
+            const choices = listAvailableChoices(node);
+            const raw = choice.trim();
+            const picked =
+              /^\d+$/.test(raw)
+                ? choices[Math.max(1, parseInt(raw, 10)) - 1]
+                : choices.find((c) => c.id === raw || c.text.includes(raw));
+            if (!picked) {
+              response =
+                choices.length === 0
+                  ? '지금은 선택할 수 있는 선택지가 없습니다.'
+                  : `선택이 올바르지 않습니다. (예: 선택 1)`;
+            } else {
+              // 효과 적용(세이브에 영구 반영되는 상태는 playerState로 들어감)
+              applyDialogueEffects(picked.effects);
+              const resultLines: string[] = [];
+              if (picked.resultText) resultLines.push(picked.resultText);
+              const nextId = picked.nextNodeId ?? null;
+              if (!nextId) {
+                setDialogueSession(null);
+                if (resultLines.length === 0) resultLines.push('대화가 끝났습니다.');
+                response = resultLines.join('\n');
+              } else {
+                const nextNode = tree.nodes[nextId];
+                if (!nextNode) {
+                  setDialogueSession(null);
+                  response = (picked.resultText ? `${picked.resultText}\n` : '') + '다음 대화 노드를 찾을 수 없습니다.';
+                } else {
+                  setDialogueSession({ npcId: tree.npcId, nodeId: nextNode.id });
+                  response = [...resultLines, formatDialogueNodeText(tree.npcId, nextNode)].filter(Boolean).join('\n\n');
+                  speakDialogue(nextNode.text, npcId);
+                }
+              }
+            }
+          }
         } else if (!npcId) {
           response = '지금은 대화 중인 NPC가 없습니다.';
         } else if (!choice || choice === '') {
-          if (npcId === 'oni') response = "[오니 선택지]: '선택 코드주기' / '선택 가입'";
-          else if (npcId === 'ghostQueen') response = "[퀸 선택지]: '선택 가입' / '선택 로맨스' / '선택 마법전수_파이어볼' / '선택 마법전수_라이트닝볼트' / '선택 마법전수_체인라이트닝' / '선택 마법전수_힐'";
-          else if (npcId === 'neonFat') response = "[네온 팻 분기]: '선택 구매' / '선택 공짜' / '선택 퀘스트'";
-          else if (npcId === 'lira') response = "[리라 선택지]: '선택 치료' (회복)";
+          const tree = getDialogueTree(npcId);
+          if (tree) {
+            const sessionNodeId =
+              dialogueSession && dialogueSession.npcId === (npcId as any) ? dialogueSession.nodeId : null;
+            const nodeId = sessionNodeId ?? tree.startNodeId;
+            const node = tree.nodes[nodeId];
+            if (!node) response = '대화 데이터를 찾을 수 없습니다. 다시 대화해 주세요.';
+            else {
+              setDialogueSession({ npcId: tree.npcId, nodeId: node.id });
+              response = formatDialogueNodeText(tree.npcId, node);
+            }
+          } else if (npcId === 'neonFat') response = "[네온 팻 분기]: '선택 구매' / '선택 공짜' / '선택 퀘스트'";
           else if (npcId === 'ironJack') response = "[아이언 잭] '선택 상점' 또는 '거래 아이언 잭'";
           else response = `[${npcId}]에게는 제시된 선택지가 없습니다.`;
-        } else if (npcId === 'oni') {
-          if (choice === '코드주기') { setPlayerState(p => ({ ...p, story: { ...p.story, karma: p.story.karma - 10, joinedFaction: '레드 드래곤' } })); response = `[쿠로사키 오니]: "흐음... 현명한 선택이다." 🔴 세력 가입!`; }
-          else if (choice === '가입') { setPlayerState(p => ({ ...p, story: { ...p.story, joinedFaction: '레드 드래곤' } })); response = `[쿠로사키 오니]: "좋아. 레드 드래곤이 널 지켜주지."`; }
-          else { response = "[오니 선택지]: '선택 코드주기' / '선택 가입'"; }
-        } else if (npcId === 'ghostQueen') {
-          if (choice === '가입') { setPlayerState(p => ({ ...p, story: { ...p.story, joinedFaction: '프리덤 네트워크' } })); response = `[고스트 퀸]: "환영해..."`; }
-          else if (choice === '로맨스') { response = `[고스트 퀸]: "나랑 데이트하고 싶어? 그 전에 실력을 증명해." (호감도 70 필요)`; }
-          else if (choice === '마법전수_파이어볼') {
-            const cost = 3000;
-            if (playerState.skills.includes('파이어볼')) { response = `[고스트 퀸]: "넌 이미 그 뜨거운 코드를 품고 있잖아."`; }
-            else if (playerState.credit < cost) { response = `[고스트 퀸]: "전송 비용이 부족해. ${cost} COIN이 필요해."`; }
-            else {
-              setPlayerState(p => ({ ...p, credit: p.credit - cost, skills: [...p.skills, '파이어볼'] }));
-              response = `[고스트 퀸]: "이 코드가 모든 걸 태워버릴 거야."\n(${cost} COIN 지불 / 신규 스킬 [파이어볼🔥] 광역기 습득!)`;
-            }
-          }
-          else if (choice === '마법전수_라이트닝볼트') {
-            const cost = 2400;
-            if (playerState.skills.includes('라이트닝 볼트')) { response = `[고스트 퀸]: "가장 완벽한 타격점은 이미 네 머리 속에 있어."`; }
-            else if (playerState.credit < cost) { response = `[고스트 퀸]: "데이터 파편이 모자라. ${cost} COIN 가져와."`; }
-            else {
-              setPlayerState(p => ({ ...p, credit: p.credit - cost, skills: [...p.skills, '라이트닝 볼트'] }));
-              response = `[고스트 퀸]: "번개의 창을 내려주지."\n(${cost} COIN 지불 / 신규 스킬 [라이트닝 볼트⚡] 강력한 단일기 습득!)`;
-            }
-          }
-          else if (choice === '마법전수_체인라이트닝') {
-            const cost = 4500;
-            if (playerState.skills.includes('체인 라이트닝')) { response = `[고스트 퀸]: "이미 연쇄 폭파 코드가 내장되어 있잖아."`; }
-            else if (playerState.credit < cost) { response = `[고스트 퀸]: "이건 고급 연산이야. ${cost} COIN이 필요해."`; }
-            else {
-              setPlayerState(p => ({ ...p, credit: p.credit - cost, skills: [...p.skills, '체인 라이트닝'] }));
-              response = `[고스트 퀸]: "여러 마리의 벌레를 한 번에 태우기에 딱 좋지."\n(${cost} COIN 지불 / 신규 스킬 [체인 라이트닝🌩️] 다중 연쇄기 습득!)`;
-            }
-          }
-          else if (choice === '마법전수_힐') {
-            const cost = 4500;
-            if (playerState.skills.includes('힐')) { response = `[고스트 퀸]: "스스로를 복구하는 프로토콜은 이미 있잖아."`; }
-            else if (playerState.credit < cost) { response = `[고스트 퀸]: "회복 모듈은 비싸. ${cost} COIN짜리야."`; }
-            else {
-              setPlayerState(p => ({ ...p, credit: p.credit - cost, skills: [...p.skills, '힐'] }));
-              response = `[고스트 퀸]: "이 따뜻한 에너지가 널 보호하길."\n(${cost} COIN 지불 / 신규 스킬 [힐💚] 강력한 자기 치유기 습득!)`;
-            }
-          }
-          else { response = "[퀸 선택지]: '선택 가입' / '선택 로맨스' / '선택 마법전수_파이어볼' / '선택 마법전수_라이트닝볼트' / '선택 마법전수_체인라이트닝' / '선택 마법전수_힐'"; }
         } else if (npcId === 'neonFat') {
           if (choice === '구매') {
             if (playerState.credit < 50) {
@@ -10307,11 +10605,6 @@ const App: React.FC = () => {
             }
           }
           else { response = "[네온 팻 분기]: '선택 구매' / '선택 공짜' / '선택 퀘스트'"; }
-        } else if (npcId === 'lira') {
-          if (choice === '치료') {
-             setPlayerState(p => ({ ...p, hp: p.maxHp }));
-             response = `[리라]: "치료 끝. 다시 흉한 꼴로 오지 마라." (HP가 가득 회복되었습니다)`;
-          } else { response = "[리라 선택지]: '선택 치료' (회복) 중에서 고르세요."; }
         } else if (npcId === 'ironJack') {
           // WHY: 대화 힌트('선택 상점')와 동작 일치 — '거래 아이언 잭'과 같은 상점 목록
           if (choice === '상점') {
@@ -10401,6 +10694,26 @@ const App: React.FC = () => {
              response = '이곳은 안전지대가 아닙니다. 적으로부터 방해받을 수 있어 휴식할 수 없습니다.';
           }
         }
+      } else if (input === '카르마') {
+        const k = playerState.story?.karma ?? 0;
+        const tier =
+          k >= 20 ? '빛(선의)'
+          : k >= 5 ? '선의'
+          : k <= -20 ? '냉혹(악의)'
+          : k <= -5 ? '거친'
+          : '중립';
+        const econ =
+          k >= 20 ? '지출 -10%'
+          : k >= 5 ? '지출 -5%'
+          : k <= -20 ? '지출 +15%'
+          : k <= -5 ? '지출 +5%'
+          : '지출 변동 없음';
+        response =
+          `☯ [카르마]\n` +
+          `- 현재: ${k} (${tier})\n` +
+          `- 효과: 대화 선택지 분기 조건 + 일부 지출 비용(${econ})\n` +
+          `- 올리는 법: 신중/협력/자비 선택\n` +
+          `- 내리는 법: 배신/협박/냉혹 선택`;
       } else if (['퀘스트', '!퀘스트'].includes(input)) {
         let questLog = '📜 [퀘스트 일지]\n';
         const activeIds = Object.keys(playerState.quests.active);
@@ -10559,7 +10872,10 @@ const App: React.FC = () => {
       reward: { kind: 'coin'; amount: number };
     }
   > = {
+    // 예시: 지능이 낮으면 못 여는 상자
+    // - 슬럼 변두리: DC 12, 최소 INT 10
     slum_s3e2s: { minInt: 10, dc: 12, minStrToBreak: 14, breakDc: 13, reward: { kind: 'coin', amount: 120 } },
+    // - 데이터 센터: DC 14, 최소 INT 12 (조사 전용 아이템 있는 방이지만, 별도 금고가 있다고 가정)
     data_center: { minInt: 12, dc: 14, minStrToBreak: 16, breakDc: 15, reward: { kind: 'coin', amount: 220 } },
   };
 
@@ -10774,9 +11090,11 @@ const App: React.FC = () => {
                       if (enemy.warriorMarkActive) statusBadges.push('🎯표식');
                       if (atkBuff > 0) statusBadges.push(`📈${atkBuff}`);
                       // 살아 있으면 반올림 0%가 되지 않게 최소 1% 표기 — 실제 HP는 1 이상일 수 있음
+                      const curHp = Math.max(0, Math.floor(Number(enemy.currentHp) || 0));
+                      const capHp = Math.max(1, Math.floor(Number(enemy.maxHp) || 1));
                       const enemyHpBarPct =
-                        enemy.maxHp > 0 && enemy.currentHp > 0
-                          ? Math.max(1, Math.min(100, Math.round((enemy.currentHp / enemy.maxHp) * 100)))
+                        capHp > 0 && curHp > 0
+                          ? Math.max(1, Math.min(100, Math.round((curHp / capHp) * 100)))
                           : 0;
                       return (
                         <div key={enemy.id} className="animate-pulse-slow">
@@ -10789,8 +11107,8 @@ const App: React.FC = () => {
                                 </span>
                               )}
                             </span>
-                            <span className="text-red-400/90 text-[10px] font-mono tabular-nums">
-                              {enemyHpBarPct}%
+                            <span className="text-red-400/90 text-[10px] font-mono tabular-nums" title="장면 패널 HP는 activeEnemies 상태와 동일 출처">
+                              {curHp}/{capHp} · {enemyHpBarPct}%
                             </span>
                           </div>
                           <div className="h-1.5 w-full bg-red-950/50 border border-red-500/30 rounded overflow-hidden">
@@ -11080,8 +11398,24 @@ const App: React.FC = () => {
           variant={miniBossQte ? 'miniBoss' : 'heavyStrike'}
           enemyName={(miniBossQte ?? heavyStrikeQte)!.enemyName}
           sequence={(miniBossQte ?? heavyStrikeQte)!.sequence}
-          stepMs={miniBossQte ? 1100 : 820}
-          prepMs={miniBossQte ? 1600 : 720}
+          stepMs={
+            miniBossQte
+              ? 1100
+              : (() => {
+                  // 강공 QTE: 전체 20초(준비 2초 제외) 안에 모든 키 — 박자 표시용 평균 간격만 계산
+                  const totalMs = 20000;
+                  const prep = 2000;
+                  const n = Math.max(1, (heavyStrikeQte?.sequence?.length ?? 1));
+                  const per = Math.floor((totalMs - prep) / n);
+                  return Math.max(2200, Math.min(5200, per));
+                })()
+          }
+          sessionMs={
+            miniBossQte
+              ? 1100 * Math.max(1, miniBossQte.sequence.length)
+              : 20000 - 2000
+          }
+          prepMs={miniBossQte ? 1600 : 2000}
           minSessionMs={miniBossQte ? 4500 : 2000}
           minOutcomeHoldMs={miniBossQte ? 2200 : 900}
           onSuccess={miniBossQte ? resolveMiniBossQteSuccess : resolveHeavyStrikeQteSuccess}

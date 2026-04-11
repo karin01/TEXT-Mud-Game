@@ -120,7 +120,9 @@ ${WORLDVIEW_DETAIL.split('\n').map((line) => `    ${line}`).join('\n')}
       getEnchantStatBonusFromTierPlus(tier, plus) = plus×4 + tierIndex×2
     tierIndex는 common=0 … legendary=5. 의도: **플러스가 티어보다 크게 기여** — 예) 레어+5의 강화분이 에픽+1보다 높을 수 있음(모든 등급 쌍에 동일 원리).
 
-[5-A. 룬(각인) 시스템 — NEURAL RUNE MATRIX]
+[5-A. 룬 시스템 — NEURAL RUNE MATRIX (※ 장비 ‘각인’과 별개)]
+  · 세계관상 이름에 ‘각인’이 쓰이지만, 본 절은 **캐릭터에 장착하는 신경 룬 14종**만 다룬다.
+  · **장비에 붙는 랜덤 옵션 묶음(인벤·로그의 「각인:」)**은 아래 [5-B]를 본다.
   · 목적: 직업과 별개로 패시브 1종 + 전용 스킬 1개를 “한 줄”에 장착·동기화한다.
   · 장착 조건: Lv.${RUNE_EQUIP_MIN_LEVEL} 이상 — 미만이면 [룬 장착]/[equip_rune]은 거부되고, 세이브에 룬만 남아 있어도 불러올 때 자동 해제(runes.ts RUNE_EQUIP_MIN_LEVEL). [룬 해제]는 레벨과 무관.
   · 데이터 단일 출처: frontend/src/data/runes.ts — RUNE_DATA(한글 노출명·id·aliases·skillKo·passiveShort).
@@ -140,6 +142,16 @@ ${WORLDVIEW_DETAIL.split('\n').map((line) => `    ${line}`).join('\n')}
         방패 착용 시 반사(철벽전도사), 은신 지연 등(그림자술사), 철의 요새·미라지·표식 등 버프는 전용 스킬과 연계.
   · 룬 14종(아래는 runes.ts와 자동 동기화된 목록):
 ${runeLines}
+
+[5-B. 장비 각인 — 미확인 감정 시 붙는 랜덤 옵션(rolledAffixes)]
+  · 정의: **별도 아이템이 아님**. 미확인(?) 장비를 감정하면 **그 인스턴스에만** 여러 줄의 옵션(스탯·저항 등)이 굴려져 붙고,
+    [장비 확인]·[인벤토리]에는 **「각인:」**으로 표시된다. 전투·스탯 합산은 items.ts의 mergeItemDataWithAffixes 경로.
+  · 명령(인게임): \`감정 <미확인 전체 이름>\` — \`각인 <같은 이름>\`과 **동일 처리**. \`각인\`만 입력 시 요약 안내.
+  · 옵션 풀(두 종류, 서로 다른 테이블 — 대사의 잭 vs 베일 블라인드와 대응):
+    - **일반 풀**: 감정 스크롤·아이언 잭 유료 감정·일반 출처 미확인 등 → data/appraisal.ts 기본 테이블(rollAppraisalAffixes 기본).
+    - **베일 전용 풀**: 홀로 거래소 **베일 크립트 블라인드**에서 산 미확인만 — 감정 시 pool 분기로 전용 문구·조합 롤.
+  · 데이터·코드 위치: frontend/src/data/appraisal.ts(롤 테이블), frontend/src/data/items.ts(합산·표시),
+    인벤 행 필드 rolledAffixes·veilBlindSource, 감정 분기는 frontend/src/App.tsx.
 
 [6. 전투 — 루프 개요]
   · 사거리(Range): shoot/저격은 현재 방이 아닌 통로 직선 상 인접 방의 적을 노린다. 지면 기본 2칸,
@@ -239,8 +251,8 @@ ${runeLines}
 
 [8. 맵 · 거점 · 거래 구조(요약)]
   · 방 단위 이동·조우·상점·NPC 대화·퀘스트. 안전지대·성벽·마을 함락/수복 등 거점 이벤트 존재.
-  · 상인별로 판매 가능 여부가 갈림(예: 아이언 잭 vs 마스터 진). 미확인 장비·감정·도박 상인 등
-    별도 규칙은 [도움말] 참고.
+  · 상인별로 판매 가능 여부가 갈림(예: 아이언 잭 vs 마스터 진). 미확인 장비·감정·베일 블라인드·도박 상인 등
+    요약은 위 [5-B], 명령 예시는 [도움말]·인게임 \`감정\`/\`각인\` 안내를 본다.
 
 [9. UI · 접근성]
   · 명령 입력 + Tab 자동완성 + 스킬 바 + 미니맵 토글. 세이브는 캐릭터 단위(로그인 플로우).
@@ -251,7 +263,8 @@ ${runeLines}
   · 적 개체 필드·강공격 intent·기절 등: frontend/src/data/enemies.ts (ActiveEnemy, clearEnemyHeavyIntent).
   · 경제 배율: frontend/src/data/economyBalance.ts.
   · 레벨·경험치 곡선: frontend/src/data/playerProgress.ts.
-  · 강화 보너스·등급 사다리: frontend/src/data/items.ts.
+  · 강화 보너스·등급 사다리·장비+각인 합산: frontend/src/data/items.ts.
+  · 미확인 감정·장비 각인(옵션 롤·베일 풀): frontend/src/data/appraisal.ts, App.tsx(감정/각인 명령).
   · 물리 방어 보정·갑옷파쇄·표식 배율: frontend/src/utils/combatFormulas.ts.
   · 무기·갑옷 속성 상성·기본 회피/가드: frontend/src/data/attributes.ts.
   · 전투 태세(ATK/DEF/가드 배율): frontend/src/data/battlePosture.ts.

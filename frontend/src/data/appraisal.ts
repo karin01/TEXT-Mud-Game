@@ -3,6 +3,7 @@
  * WHY: 수치는 ItemOptionMods로만 전투에 반영하고, labelKo는 플레이어가 읽는 맛(변동·치명 등)을 살린다.
  */
 import type { ElementType } from './elemental';
+import type { ArmorAttribute } from './attributes';
 import type { ItemData, ItemOptionMods } from './items';
 // WHY: type-only import — 런타임 순환 참조(items ↔ appraisal) 방지
 
@@ -16,12 +17,31 @@ type AppraisalKindDef = {
   types: EquipKind[];
   /** 신속/파멸 계열: 이름 대신 태그로 전투 보정을 넘긴다 */
   tag?: 'swift' | 'destructive';
-  roll: (rng: () => number) => RolledAffixLine;
+  roll: (rng: () => number, itemDef: ItemData) => RolledAffixLine;
 };
 
 function mergeResAll(valueEach: number): Partial<Record<ElementType, number>> {
   const v = Math.round(valueEach * 1000) / 1000;
   return { 불: v, 얼음: v, 전기: v, 독: v };
+}
+
+function armorAttrKo(attr: ArmorAttribute): string {
+  // 유저 표현에 맞춰 '사슬'은 로그/표기에서 '경갑'으로 부른다.
+  return attr === '사슬' ? '경갑' : attr;
+}
+
+function inferArmorAttrFromItemDef(itemDef: ItemData): ArmorAttribute | null {
+  if (itemDef.type !== 'armor') return null;
+  const n = itemDef.name;
+  if (n.includes('천') || n.includes('로브')) return '천';
+  if (n.includes('가죽')) return '가죽';
+  if (n.includes('사슬')) return '사슬';
+  if (n.includes('판금')) return '판금';
+  return null;
+}
+
+function modArmorAttrDef(attr: ArmorAttribute, v: number): ItemOptionMods {
+  return { armorDefenseBonusByArmorAttr: { [attr]: v } };
 }
 
 /** 타입별 출현 가능한 감정 옵션 풀 */
@@ -186,6 +206,58 @@ const APPRAISAL_KINDS: AppraisalKindDef[] = [
         labelKo: `독 피해 ${lo}–${hi} 추가 (평균 ${mid})`,
         mods: { elementDamage: { 독: mid } },
       };
+    },
+  },
+
+  // ── 재질별 방어력 증가(요청) ──
+  // 악세사리: 착용자 '현재 갑옷 재질'에 따라 DEF가 오르는 옵션
+  {
+    id: 'armor_attr_def_cloth_accessory',
+    weight: 7,
+    types: ['accessory'],
+    roll: (rng) => {
+      const v = 1 + Math.floor(rng() * 9);
+      return { labelKo: `천 방어력 증가 +${v}`, mods: modArmorAttrDef('천', v) };
+    },
+  },
+  {
+    id: 'armor_attr_def_leather_accessory',
+    weight: 7,
+    types: ['accessory'],
+    roll: (rng) => {
+      const v = 1 + Math.floor(rng() * 9);
+      return { labelKo: `가죽 방어력 증가 +${v}`, mods: modArmorAttrDef('가죽', v) };
+    },
+  },
+  {
+    id: 'armor_attr_def_light_accessory',
+    weight: 7,
+    types: ['accessory'],
+    roll: (rng) => {
+      const v = 1 + Math.floor(rng() * 9);
+      return { labelKo: `경갑 방어력 증가 +${v}`, mods: modArmorAttrDef('사슬', v) };
+    },
+  },
+  {
+    id: 'armor_attr_def_plate_accessory',
+    weight: 7,
+    types: ['accessory'],
+    roll: (rng) => {
+      const v = 1 + Math.floor(rng() * 9);
+      return { labelKo: `판금 방어력 증가 +${v}`, mods: modArmorAttrDef('판금', v) };
+    },
+  },
+
+  // 갑옷: 자신의 재질에 맞는 “재질 방어력 증가”가 붙을 수 있게 (확률 롤)
+  {
+    id: 'armor_attr_def_match_armor',
+    weight: 8,
+    types: ['armor'],
+    roll: (rng, itemDef) => {
+      const attr = inferArmorAttrFromItemDef(itemDef);
+      const v = 1 + Math.floor(rng() * 9);
+      if (!attr) return { labelKo: `방어력 +${v}`, mods: { bonusDefense: v } };
+      return { labelKo: `${armorAttrKo(attr)} 방어력 증가 +${v}`, mods: modArmorAttrDef(attr, v) };
     },
   },
   {
@@ -718,7 +790,7 @@ export function rollAppraisalAffixes(
     const j = availIdx[pickWeightedIndex(subW, rng)];
     const def = pool[j];
     used.add(def.id);
-    lines.push(def.roll(rng));
+    lines.push(def.roll(rng, itemDef));
     if (def.tag === 'swift' && !combatTags.includes('swift')) combatTags.push('swift');
     if (def.tag === 'destructive' && !combatTags.includes('destructive')) combatTags.push('destructive');
   }

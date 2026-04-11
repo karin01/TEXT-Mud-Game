@@ -11,8 +11,13 @@ type Props = {
   sequence: MiniBossQteKey[];
   /** 준보스 개시 QTE vs 강공격 1타 대응 — 결과 문구만 다름 */
   variant?: QteVariant;
-  /** 한 입력당 제한 시간(ms) — 박자(리듬) 주기와 동일 */
+  /** 리듬 애니메이션·BPM 표시용 박자 주기(ms) — 전체 남은 시간과 별개 */
   stepMs?: number;
+  /**
+   * 준비 종료 후 ~ 성공/실패까지의 총 제한 시간(ms).
+   * WHY: 키를 맞출 때마다 타이머를 초기화하면 안 되므로, 한 번만 설정하는 세션 마감으로 통일한다.
+   */
+  sessionMs?: number;
   /** 오픈 직후 이 시간(ms) 동안은 실패·입력 없이 설명만 표시 (너무 빨리 지나가는 문제 완화) */
   prepMs?: number;
   /**
@@ -32,6 +37,7 @@ export default function CombatQteOverlay({
   sequence,
   variant = 'miniBoss',
   stepMs = 1100,
+  sessionMs: sessionMsProp,
   prepMs = 1600,
   minSessionMs = 4500,
   minOutcomeHoldMs = 2200,
@@ -44,7 +50,8 @@ export default function CombatQteOverlay({
   const [prepActive, setPrepActive] = useState(true);
   /** 게임 진행 통지 전까지 결과 문구 표시 */
   const [outcome, setOutcome] = useState<'idle' | 'success' | 'fail'>('idle');
-  const deadlineRef = useRef(0);
+  /** 준비 종료 시점부터의 절대 마감 시각 — 키 성공 시 갱신하지 않음 */
+  const sessionEndRef = useRef(0);
   const settledRef = useRef(false);
   const openedAtRef = useRef(0);
   const parentNotifyTimerRef = useRef<number | null>(null);
@@ -101,9 +108,9 @@ export default function CombatQteOverlay({
     setIndex(0);
     setPrepActive(true);
     setOutcome('idle');
-    // 준비 중에는 데드라인을 멀리 두어 interval이 실패시키지 않게 함
-    deadlineRef.current = Date.now() + 9e9;
-  }, [open, sequence, stepMs, prepMs]);
+    // 준비 중에는 세션 마감을 멀리 두어 interval이 실패시키지 않게 함
+    sessionEndRef.current = Date.now() + 9e9;
+  }, [open, sequence, stepMs, prepMs, sessionMsProp]);
 
   useEffect(() => {
     return () => {
@@ -118,10 +125,14 @@ export default function CombatQteOverlay({
     if (!open || sequence.length === 0 || !prepActive) return;
     const tid = window.setTimeout(() => {
       setPrepActive(false);
-      deadlineRef.current = Date.now() + stepMs;
+      const total =
+        sessionMsProp != null && Number.isFinite(sessionMsProp) && sessionMsProp > 0
+          ? Math.floor(sessionMsProp)
+          : stepMs * Math.max(1, sequence.length);
+      sessionEndRef.current = Date.now() + total;
     }, prepMs);
     return () => window.clearTimeout(tid);
-  }, [open, sequence, prepMs, stepMs, prepActive]);
+  }, [open, sequence, prepMs, stepMs, prepActive, sessionMsProp]);
 
   useEffect(() => {
     if (!open || sequence.length === 0 || settledRef.current) return;
@@ -129,10 +140,10 @@ export default function CombatQteOverlay({
       setTick((n) => n + 1);
       if (settledRef.current) return;
       if (prepActive) return;
-      if (Date.now() > deadlineRef.current) finishFail();
+      if (Date.now() > sessionEndRef.current) finishFail();
     }, 100);
     return () => window.clearInterval(t);
-  }, [open, sequence, stepMs, index, finishFail, prepActive]);
+  }, [open, sequence, stepMs, finishFail, prepActive]);
 
   const tryKey = useCallback(
     (k: string) => {
@@ -148,7 +159,7 @@ export default function CombatQteOverlay({
         return;
       }
       setIndex(next);
-      deadlineRef.current = Date.now() + stepMs;
+      // WHY: 키 성공 시 전체 남은 시간은 초기화하지 않음 (세션 마감 유지)
     },
     [open, sequence, index, stepMs, prepActive, finishFail, finishOk]
   );
@@ -179,8 +190,12 @@ export default function CombatQteOverlay({
 
   if (!open || sequence.length === 0) return null;
 
-  const remain = Math.max(0, deadlineRef.current - Date.now());
-  const frac = prepActive ? 1 : stepMs > 0 ? Math.min(1, remain / stepMs) : 0;
+  const sessionTotalForBar =
+    sessionMsProp != null && Number.isFinite(sessionMsProp) && sessionMsProp > 0
+      ? Math.floor(sessionMsProp)
+      : stepMs * Math.max(1, sequence.length);
+  const remain = Math.max(0, sessionEndRef.current - Date.now());
+  const frac = prepActive ? 1 : sessionTotalForBar > 0 ? Math.min(1, remain / sessionTotalForBar) : 0;
   void tick;
 
   const keyButtonClass =
@@ -242,7 +257,7 @@ export default function CombatQteOverlay({
                   animationIterationCount: 'infinite',
                 }}
               />
-              한 박당 약 {(60000 / stepMs).toFixed(1)} BPM 느낌 · 타임바가 끝나기 전에 누르세요
+              한 박당 약 {(60000 / stepMs).toFixed(1)} BPM 느낌 · 아래 바는 전체 남은 시간(키마다 초기화되지 않음)
             </p>
           )}
           <div className="mb-4 flex flex-wrap justify-center gap-2">
@@ -306,8 +321,8 @@ export default function CombatQteOverlay({
               : prepActive
                 ? '준비 시간에는 키/버튼 입력이 막혀 있습니다.'
                 : variant === 'heavyStrike'
-                  ? `입력당 약 ${Math.round(stepMs / 100) / 10}초 · 오타·시간 초과 시 실패 · 성공 시 이 한 방은 회피`
-                  : `입력당 약 ${Math.round(stepMs / 100) / 10}초 · 오타 시 실패 · 성공 시 준보스 기절 턴 +1`}
+                  ? `전체 약 ${Math.round(sessionTotalForBar / 100) / 10}초 · 오타·시간 초과 시 실패 · 성공 시 이 한 방은 회피`
+                  : `전체 약 ${Math.round(sessionTotalForBar / 100) / 10}초 · 오타 시 실패 · 성공 시 준보스 기절 턴 +1`}
           </p>
         </div>
       </div>

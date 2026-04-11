@@ -43,6 +43,8 @@ export interface SavedCharacter {
     joinedFaction: string | null;
     romancePartner: string | null;
     defeatedBosses: string[];
+    /** 대화 분기 플래그 저장소 (데이터 기반 대화 트리용) */
+    dialogueFlags: Record<string, boolean>;
     /** 미로 3구역(maze_s4) 최초 진입 시 직업 룬 지급 완료 여부 */
     grantedMazeZone3FirstRune?: boolean;
     /** 특정 방에서 조사 룬 복구 1회 수령한 방 id (중복 방지) */
@@ -162,7 +164,11 @@ export function loadCharacter(name: string): SavedCharacter | null {
   const raw = localStorage.getItem(getSaveKey(name));
   if (!raw) return null;
   try {
-    return JSON.parse(raw) as SavedCharacter;
+    const parsed = JSON.parse(raw) as SavedCharacter;
+    // 구세이브 호환: 새 필드 기본값 보정
+    if (!(parsed as any).story) (parsed as any).story = {} as any;
+    if (!(parsed as any).story.dialogueFlags) (parsed as any).story.dialogueFlags = {};
+    return parsed;
   } catch {
     return null;
   }
@@ -224,6 +230,7 @@ export function createNewCharacter(
       joinedFaction: null,
       romancePartner: null,
       defeatedBosses: [],
+      dialogueFlags: {},
       grantedMazeZone3FirstRune: false,
       runeRestoreUsedRoomIds: [],
     },

@@ -1,5 +1,6 @@
 import type { ElementType } from './elemental';
 import type { RolledAffixLine } from './appraisal';
+import type { ArmorAttribute } from './attributes';
 import { scaleCoinCost } from './economyBalance';
 
 /** 아이템 등급: 커먼 → … → 에픽 → 레전드리(상점 비판매·드랍 전용 권장) */
@@ -172,6 +173,7 @@ export type ItemOptionMods = Partial<Pick<
   | 'bonusInt'
   | 'bonusSpr'
   | 'bonusDefense'
+  | 'armorDefenseBonusByArmorAttr'
   | 'lifeStealPercent'
   | 'poisonChance'
   | 'elementDamage'
@@ -235,6 +237,11 @@ export interface ItemData {
   maxDamage?: number;  // 최대 무기 공격력
   defense?: number; // 방어구/방패/장신구 방어력 (Armor/Shield/Accessory DEF)
   bonusDefense?: number; // 갑옷/방패 전용: 랜덤 방어력 증가 옵션 (실제 방어력 = defense + bonusDefense)
+  /**
+   * 재질별 방어력 증가(주로 악세/감정 옵션에서 사용).
+   * 예: { 천: 2 }면 “천 방어구를 입고 있을 때” DEF +2
+   */
+  armorDefenseBonusByArmorAttr?: Partial<Record<ArmorAttribute, number>>;
   price?: number; // 상점 구매/판매 기본가 (판매가는 30%)
   description: string;
   // 스탯 보너스 (장비/장신구/무기 옵션)
@@ -825,6 +832,16 @@ export function mergeItemDataWithAffixes(base: ItemData, affixLines: RolledAffix
     if (m.bonusInt) merged.bonusInt = (merged.bonusInt ?? 0) + m.bonusInt;
     if (m.bonusSpr) merged.bonusSpr = (merged.bonusSpr ?? 0) + m.bonusSpr;
     if (m.bonusDefense) merged.bonusDefense = (merged.bonusDefense ?? 0) + m.bonusDefense;
+    if (m.armorDefenseBonusByArmorAttr) {
+      const prev = merged.armorDefenseBonusByArmorAttr ?? {};
+      const next: Partial<Record<ArmorAttribute, number>> = { ...prev };
+      for (const [k, v] of Object.entries(m.armorDefenseBonusByArmorAttr)) {
+        if (v == null || Number.isNaN(v)) continue;
+        const key = k as ArmorAttribute;
+        next[key] = (next[key] ?? 0) + v;
+      }
+      merged.armorDefenseBonusByArmorAttr = next;
+    }
     if (m.lifeStealPercent) merged.lifeStealPercent = (merged.lifeStealPercent ?? 0) + m.lifeStealPercent;
     if (m.poisonChance) merged.poisonChance = (merged.poisonChance ?? 0) + m.poisonChance;
     if (m.bonusCritChance) merged.bonusCritChance = (merged.bonusCritChance ?? 0) + m.bonusCritChance;
@@ -892,11 +909,27 @@ export function applyItemInstanceLevelToMergedItem(data: ItemData, level: number
   if (out.type === 'armor' || out.type === 'shield') {
     if (out.defense != null) out.defense = Math.max(0, Math.round(out.defense * m));
     if (out.bonusDefense != null) out.bonusDefense = Math.round(out.bonusDefense * m);
+    if (out.armorDefenseBonusByArmorAttr) {
+      const next: Partial<Record<ArmorAttribute, number>> = { ...out.armorDefenseBonusByArmorAttr };
+      for (const [k, v] of Object.entries(next)) {
+        if (v == null || Number.isNaN(v)) continue;
+        next[k as ArmorAttribute] = Math.max(0, Math.round(v * m));
+      }
+      out.armorDefenseBonusByArmorAttr = next;
+    }
   }
   if (out.type === 'accessory' && (out.slot === 'ring' || out.slot === 'necklace')) {
     if (out.defense != null && out.defense > 0) out.defense = Math.max(0, Math.round(out.defense * m));
     if (out.bonusDefense != null && out.bonusDefense > 0) {
       out.bonusDefense = Math.max(0, Math.round(out.bonusDefense * m));
+    }
+    if (out.armorDefenseBonusByArmorAttr) {
+      const next: Partial<Record<ArmorAttribute, number>> = { ...out.armorDefenseBonusByArmorAttr };
+      for (const [k, v] of Object.entries(next)) {
+        if (v == null || Number.isNaN(v)) continue;
+        next[k as ArmorAttribute] = Math.max(0, Math.round(v * m));
+      }
+      out.armorDefenseBonusByArmorAttr = next;
     }
   }
   return out;
